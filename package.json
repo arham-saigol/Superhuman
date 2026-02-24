@@ -1,0 +1,23 @@
+{
+  "name": "superhuman",
+  "private": true,
+  "version": "0.1.0",
+  "packageManager": "pnpm@10.5.2",
+  "bin": {
+    "superhuman": "apps/cli/dist/index.js"
+  },
+  "scripts": {
+    "build": "pnpm -r build && node scripts/ensure-superhuman-bin.mjs",
+    "dev": "pnpm -r --parallel dev",
+    "dev:webui": "npm --prefix vendor/open-webui run dev",
+    "build:webui": "npm --prefix vendor/open-webui run build",
+    "typecheck": "pnpm -r typecheck",
+    "test": "pnpm -r test",
+    "lint": "pnpm -r lint"
+  },
+  "devDependencies": {
+    "typescript": "^5.9.2",
+    "tsx": "^4.20.5",
+    "@types/node": "^24.3.0"
+  }
+}

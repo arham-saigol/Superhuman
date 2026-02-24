@@ -1,0 +1,30 @@
+{
+  "name": "@superhuman/web",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "dist/server.js",
+  "types": "dist/server.d.ts",
+  "scripts": {
+    "dev": "tsx watch src/server.ts",
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/server.js",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "node -e \"console.log('no tests yet')\"",
+    "lint": "node -e \"console.log('no lint config yet')\""
+  },
+  "dependencies": {
+    "@fastify/cors": "^11.1.0",
+    "@superhuman/agent": "workspace:*",
+    "@superhuman/core": "workspace:*",
+    "@superhuman/providers": "workspace:*",
+    "convex": "^1.24.8",
+    "fastify": "^5.6.0",
+    "ioredis": "^5.7.0",
+    "zod": "^4.1.5"
+  },
+  "devDependencies": {
+    "tsx": "^4.20.5",
+    "typescript": "^5.9.2"
+  }
+}

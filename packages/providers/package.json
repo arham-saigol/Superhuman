@@ -1,0 +1,19 @@
+{
+  "name": "@superhuman/providers",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "node -e \"console.log('no tests yet')\"",
+    "lint": "node -e \"console.log('no lint config yet')\""
+  },
+  "dependencies": {
+    "@ai-sdk/openai": "^2.0.61",
+    "@superhuman/core": "workspace:*",
+    "ai": "^5.0.47"
+  }
+}

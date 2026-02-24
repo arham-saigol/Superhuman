@@ -1,0 +1,29 @@
+[Unit]
+Description=Superhuman Open WebUI Frontend
+After=network-online.target superhuman-web.service
+Wants=network-online.target superhuman-web.service
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/superhuman/vendor/open-webui
+EnvironmentFile=/opt/superhuman/.env
+Environment=NODE_ENV=production
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+ExecStart=/usr/bin/env bash -lc 'export VITE_SUPERHUMAN_WEBUI_BASE_URL=${APP_URL:-http://127.0.0.1:3000}; npm run preview -- --host 0.0.0.0 --port 4173'
+Restart=always
+RestartSec=5
+TimeoutStopSec=30
+KillSignal=SIGTERM
+KillMode=mixed
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+ReadWritePaths=/opt/superhuman/vendor/open-webui
+LimitNOFILE=65535
+UMask=0027
+User=superhuman
+Group=superhuman
+
+[Install]
+WantedBy=multi-user.target

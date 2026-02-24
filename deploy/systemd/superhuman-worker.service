@@ -1,0 +1,29 @@
+[Unit]
+Description=Superhuman Worker Service
+After=network-online.target redis-server.service
+Wants=network-online.target redis-server.service
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/superhuman
+EnvironmentFile=/opt/superhuman/.env
+Environment=NODE_ENV=production
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+ExecStart=/usr/bin/env pnpm --filter @superhuman/worker start
+Restart=always
+RestartSec=5
+TimeoutStopSec=30
+KillSignal=SIGTERM
+KillMode=mixed
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+ReadWritePaths=/opt/superhuman
+LimitNOFILE=65535
+UMask=0027
+User=superhuman
+Group=superhuman
+
+[Install]
+WantedBy=multi-user.target

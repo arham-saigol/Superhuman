@@ -1,0 +1,2126 @@
+    1: import Fastify from "fastify";
+    2: import cors from "@fastify/cors";
+    3: import Redis from "ioredis";
+    4: import { ConvexHttpClient } from "convex/browser";
+    5: import { randomUUID, createHash, randomBytes } from "node:crypto";
+    6: import { enqueueTask, getTaskStatus, setTaskStatus } from "@superhuman/agent";
+    7: import { loadEnv, logger, encryptString } from "@superhuman/core";
+    8: import { generateModelResponse, listOpenAIStyleModels, type OpenAIStyleChatCompletionRequest } from "@superhuman/providers";
+    9: 
+   10: const env = loadEnv();
+   11: const app = Fastify({ logger: false });
+   12: 
+   13: type RedisClient = {
+   14:   ping: () => Promise<string>;
+   15:   get: (key: string) => Promise<string | null>;
+   16:   set: (key: string, value: string, ...args: Array<string | number>) => Promise<unknown>;
+   17:   hset: (key: string, values: Record<string, string | number>) => Promise<number>;
+   18:   hgetall: (key: string) => Promise<Record<string, string>>;
+   19:   expire: (key: string, seconds: number) => Promise<number>;
+   20:   lpush: (key: string, value: string) => Promise<number>;
+   21:   rpop: (key: string) => Promise<string | null>;
+   22:   zadd: (key: string, score: number, member: string) => Promise<number>;
+   23:   zrangebyscore: (key: string, min: number, max: number, ...rest: Array<string | number>) => Promise<string[]>;
+   24:   zrem: (key: string, ...members: string[]) => Promise<number>;
+   25:   del: (...keys: string[]) => Promise<number>;
+   26: };
+   27: 
+   28: const redis = new (Redis as unknown as new (url: string, options: { maxRetriesPerRequest: null }) => RedisClient)(
+   29:   env.REDIS_URL,
+   30:   { maxRetriesPerRequest: null }
+   31: );
+   32: 
+   33: const AUTH_USER_PREFIX = "superhuman:auth:user:";
+   34: const AUTH_SESSION_PREFIX = "superhuman:auth:session:";
+   35: const CHAT_STORE_PREFIX = "superhuman:db:chats:";
+   36: const FOLDER_STORE_PREFIX = "superhuman:db:folders:";
+   37: const CHAT_TASKS_PREFIX = "superhuman:chat:tasks:";
+   38: const OAUTH_PENDING_PREFIX = "superhuman:oauth:pending:";
+   39: const OAUTH_STATUS_PREFIX = "superhuman:oauth:status:";
+   40: const ALLOWLIST_CACHE_TTL_MS = 30_000;
+   41: const allowlistCache = new Map<string, { allowed: boolean; expiresAt: number }>();
+   42: 
+   43: type OAuthProvider = "codex" | "qwen";
+   44: 
+   45: type SessionRecord = {
+   46:   id: string;
+   47:   email: string;
+   48:   name: string;
+   49:   role: string;
+   50:   accessGranted: string;
+   51: };
+   52: 
+   53: type ChatRecord = {
+   54:   id: string;
+   55:   user_id: string;
+   56:   title: string;
+   57:   chat: Record<string, unknown>;
+   58:   meta: Record<string, unknown>;
+   59:   folder_id: string | null;
+   60:   pinned: boolean;
+   61:   archived: boolean;
+   62:   share_id: string | null;
+   63:   tags: Array<{ name: string }>;
+   64:   created_at: number;
+   65:   updated_at: number;
+   66: };
+   67: 
+   68: type FolderRecord = {
+   69:   id: string;
+   70:   user_id: string;
+   71:   name: string;
+   72:   parent_id: string | null;
+   73:   is_expanded: boolean;
+   74:   data: Record<string, unknown>;
+   75:   meta: Record<string, unknown>;
+   76:   items: { chat_ids: string[]; file_ids: string[] };
+   77:   created_at: number;
+   78:   updated_at: number;
+   79: };
+   80: 
+   81: function hashPassword(password: string): string {
+   82:   return createHash("sha256").update(password).digest("hex");
+   83: }
+   84: 
+   85: function normalizeEmail(email: string): string {
+   86:   return email.trim().toLowerCase();
+   87: }
+   88: 
+   89: function bearerToken(authorization?: string): string | null {
+   90:   if (!authorization?.startsWith("Bearer ")) {
+   91:     return null;
+   92:   }
+   93:   return authorization.slice(7);
+   94: }
+   95: 
+   96: async function readSession(token: string) {
+   97:   const session = await redis.hgetall(`${AUTH_SESSION_PREFIX}${token}`);
+   98:   if (!session || Object.keys(session).length === 0) return null;
+   99:   return session;
+  100: }
+  101: 
+  102: function buildPermissions() {
+  103:   return {
+  104:     features: {
+  105:       channels: false,
+  106:       notes: false,
+  107:       folders: true,
+  108:       web_search: true,
+  109:       image_generation: false,
+  110:       code_interpreter: false,
+  111:       voice_call: false
+  112:     },
+  113:     workspace: {
+  114:       models: false,
+  115:       knowledge: false,
+  116:       prompts: false,
+  117:       tools: true,
+  118:       skills: false
+  119:     },
+  120:     chat: {
+  121:       controls: true,
+  122:       temporary: true,
+  123:       temporary_enforced: false,
+  124:       share: false,
+  125:       export: false,
+  126:       system_prompt: false
+  127:     }
+  128:   };
+  129: }
+  130: 
+  131: function buildSessionUser(session: Record<string, string>, token: string) {
+  132:   return {
+  133:     id: session.id,
+  134:     email: session.email,
+  135:     name: session.name,
+  136:     role: session.role,
+  137:     token,
+  138:     token_type: "Bearer",
+  139:     expires_at: Math.floor((Date.now() + 60 * 60 * 24 * 7 * 1000) / 1000),
+  140:     permissions: buildPermissions(),
+  141:     profile_image_url: `/api/v1/users/${encodeURIComponent(session.email ?? session.id ?? "user")}/profile/image`,
+  142:     access_granted: session.accessGranted === "true"
+  143:   };
+  144: }
+  145: 
+  146: function sessionCookie(token: string | null): string {
+  147:   const attrs = ["Path=/", "HttpOnly", "SameSite=Lax"];
+  148:   if (env.APP_URL.startsWith("https://")) {
+  149:     attrs.push("Secure");
+  150:   }
+  151: 
+  152:   if (!token) {
+  153:     attrs.push("Max-Age=0");
+  154:     return `token=; ${attrs.join("; ")}`;
+  155:   }
+  156: 
+  157:   attrs.push(`Max-Age=${60 * 60 * 24 * 7}`);
+  158:   return `token=${token}; ${attrs.join("; ")}`;
+  159: }
+  160: 
+  161: function nowUnixSeconds(): number {
+  162:   return Math.floor(Date.now() / 1000);
+  163: }
+  164: 
+  165: function toUnixSeconds(value: unknown, fallback: number): number {
+  166:   if (typeof value !== "number" || !Number.isFinite(value)) {
+  167:     return fallback;
+  168:   }
+  169: 
+  170:   // Accept milliseconds from imported payloads and normalize to seconds.
+  171:   return value > 10_000_000_000 ? Math.floor(value / 1000) : Math.floor(value);
+  172: }
+  173: 
+  174: function isRecord(value: unknown): value is Record<string, unknown> {
+  175:   return typeof value === "object" && value !== null && !Array.isArray(value);
+  176: }
+  177: 
+  178: function textOr(value: unknown, fallback: string): string {
+  179:   return typeof value === "string" && value.trim().length > 0 ? value.trim() : fallback;
+  180: }
+  181: 
+  182: function normalizeTags(tags: unknown): Array<{ name: string }> {
+  183:   if (!Array.isArray(tags)) {
+  184:     return [];
+  185:   }
+  186: 
+  187:   const out: Array<{ name: string }> = [];
+  188:   for (const tag of tags) {
+  189:     if (typeof tag === "string" && tag.trim()) {
+  190:       out.push({ name: tag.trim() });
+  191:     } else if (isRecord(tag) && typeof tag.name === "string" && tag.name.trim()) {
+  192:       out.push({ name: tag.name.trim() });
+  193:     }
+  194:   }
+  195: 
+  196:   const deduped = new Map<string, { name: string }>();
+  197:   for (const tag of out) {
+  198:     deduped.set(tag.name.toLowerCase(), tag);
+  199:   }
+  200:   return [...deduped.values()];
+  201: }
+  202: 
+  203: function chatStoreKey(userId: string): string {
+  204:   return `${CHAT_STORE_PREFIX}${userId}`;
+  205: }
+  206: 
+  207: function folderStoreKey(userId: string): string {
+  208:   return `${FOLDER_STORE_PREFIX}${userId}`;
+  209: }
+  210: 
+  211: function chatTasksKey(chatId: string): string {
+  212:   return `${CHAT_TASKS_PREFIX}${chatId}`;
+  213: }
+  214: 
+  215: async function loadJson<T>(key: string, fallback: T): Promise<T> {
+  216:   const raw = await redis.get(key);
+  217:   if (!raw) {
+  218:     return fallback;
+  219:   }
+  220: 
+  221:   try {
+  222:     return JSON.parse(raw) as T;
+  223:   } catch {
+  224:     return fallback;
+  225:   }
+  226: }
+  227: 
+  228: async function saveJson<T>(key: string, value: T): Promise<void> {
+  229:   await redis.set(key, JSON.stringify(value));
+  230: }
+  231: 
+  232: async function loadChats(userId: string): Promise<ChatRecord[]> {
+  233:   const rows = await loadJson<ChatRecord[]>(chatStoreKey(userId), []);
+  234:   return rows.sort((a, b) => b.updated_at - a.updated_at);
+  235: }
+  236: 
+  237: async function saveChats(userId: string, chats: ChatRecord[]): Promise<void> {
+  238:   await saveJson(chatStoreKey(userId), chats);
+  239: }
+  240: 
+  241: async function loadFolders(userId: string): Promise<FolderRecord[]> {
+  242:   const rows = await loadJson<FolderRecord[]>(folderStoreKey(userId), []);
+  243:   return rows.sort((a, b) => b.updated_at - a.updated_at);
+  244: }
+  245: 
+  246: async function saveFolders(userId: string, folders: FolderRecord[]): Promise<void> {
+  247:   await saveJson(folderStoreKey(userId), folders);
+  248: }
+  249: 
+  250: function buildChatTitle(chatPayload: Record<string, unknown>, fallback: string): string {
+  251:   const direct = textOr(chatPayload.title, "");
+  252:   if (direct) {
+  253:     return direct;
+  254:   }
+  255: 
+  256:   const messages = Array.isArray(chatPayload.messages) ? chatPayload.messages : [];
+  257:   for (const message of messages) {
+  258:     if (isRecord(message) && message.role === "user" && typeof message.content === "string" && message.content.trim()) {
+  259:       return message.content.trim().slice(0, 80);
+  260:     }
+  261:   }
+  262: 
+  263:   return fallback;
+  264: }
+  265: 
+  266: function normalizeChatRecord(userId: string, candidate: Partial<ChatRecord> & { id: string }): ChatRecord {
+  267:   const now = nowUnixSeconds();
+  268:   return {
+  269:     id: candidate.id,
+  270:     user_id: userId,
+  271:     title: textOr(candidate.title, "New Chat"),
+  272:     chat: isRecord(candidate.chat) ? candidate.chat : {},
+  273:     meta: isRecord(candidate.meta) ? candidate.meta : {},
+  274:     folder_id: typeof candidate.folder_id === "string" ? candidate.folder_id : null,
+  275:     pinned: Boolean(candidate.pinned),
+  276:     archived: Boolean(candidate.archived),
+  277:     share_id: typeof candidate.share_id === "string" ? candidate.share_id : null,
+  278:     tags: normalizeTags(candidate.tags),
+  279:     created_at: toUnixSeconds(candidate.created_at, now),
+  280:     updated_at: toUnixSeconds(candidate.updated_at, now)
+  281:   };
+  282: }
+  283: 
+  284: function normalizeFolderRecord(userId: string, candidate: Partial<FolderRecord> & { id: string }): FolderRecord {
+  285:   const now = nowUnixSeconds();
+  286:   const items: Record<string, unknown> = isRecord(candidate.items) ? candidate.items : {};
+  287:   const chatIds = Array.isArray(items.chat_ids)
+  288:     ? items.chat_ids.filter((x: unknown): x is string => typeof x === "string")
+  289:     : [];
+  290:   const fileIds = Array.isArray(items.file_ids)
+  291:     ? items.file_ids.filter((x: unknown): x is string => typeof x === "string")
+  292:     : [];
+  293: 
+  294:   return {
+  295:     id: candidate.id,
+  296:     user_id: userId,
+  297:     name: textOr(candidate.name, "Folder"),
+  298:     parent_id: typeof candidate.parent_id === "string" ? candidate.parent_id : null,
+  299:     is_expanded: candidate.is_expanded ?? true,
+  300:     data: isRecord(candidate.data) ? candidate.data : {},
+  301:     meta: isRecord(candidate.meta) ? candidate.meta : {},
+  302:     items: { chat_ids: chatIds, file_ids: fileIds },
+  303:     created_at: toUnixSeconds(candidate.created_at, now),
+  304:     updated_at: toUnixSeconds(candidate.updated_at, now)
+  305:   };
+  306: }
+  307: 
+  308: type OAuthProviderConfig = {
+  309:   provider: OAuthProvider;
+  310:   clientId: string;
+  311:   clientSecret?: string;
+  312:   authorizationUrl: string;
+  313:   tokenUrl: string;
+  314:   scopes: string[];
+  315: };
+  316: 
+  317: function isOAuthProvider(value: string): value is OAuthProvider {
+  318:   return value === "codex" || value === "qwen";
+  319: }
+  320: 
+  321: function oauthProviderConfig(provider: OAuthProvider): OAuthProviderConfig | null {
+  322:   if (provider === "codex") {
+  323:     if (!env.CODEX_OAUTH_CLIENT_ID) {
+  324:       return null;
+  325:     }
+  326:     return {
+  327:       provider,
+  328:       clientId: env.CODEX_OAUTH_CLIENT_ID,
+  329:       clientSecret: env.CODEX_OAUTH_CLIENT_SECRET || undefined,
+  330:       authorizationUrl: env.CODEX_OAUTH_AUTH_URL,
+  331:       tokenUrl: env.CODEX_OAUTH_TOKEN_URL,
+  332:       scopes: env.CODEX_OAUTH_SCOPES.split(/\s+/).filter(Boolean)
+  333:     };
+  334:   }
+  335: 
+  336:   if (!env.QWEN_OAUTH_CLIENT_ID) {
+  337:     return null;
+  338:   }
+  339:   return {
+  340:     provider,
+  341:     clientId: env.QWEN_OAUTH_CLIENT_ID,
+  342:     clientSecret: env.QWEN_OAUTH_CLIENT_SECRET || undefined,
+  343:     authorizationUrl: env.QWEN_OAUTH_AUTH_URL,
+  344:     tokenUrl: env.QWEN_OAUTH_TOKEN_URL,
+  345:     scopes: env.QWEN_OAUTH_SCOPES.split(/\s+/).filter(Boolean)
+  346:   };
+  347: }
+  348: 
+  349: function oauthStatusKey(provider: OAuthProvider, state: string): string {
+  350:   return `${OAUTH_STATUS_PREFIX}${provider}:${state}`;
+  351: }
+  352: 
+  353: function oauthPendingKey(provider: OAuthProvider, state: string): string {
+  354:   return `${OAUTH_PENDING_PREFIX}${provider}:${state}`;
+  355: }
+  356: 
+  357: function oauthRedirectUri(provider: OAuthProvider): string {
+  358:   return `${env.APP_URL.replace(/\/$/, "")}/oauth/callback/${provider}`;
+  359: }
+  360: 
+  361: function base64url(input: Buffer): string {
+  362:   return input
+  363:     .toString("base64")
+  364:     .replace(/\+/g, "-")
+  365:     .replace(/\//g, "_")
+  366:     .replace(/=+$/g, "");
+  367: }
+  368: 
+  369: function createPkcePair(): { verifier: string; challenge: string } {
+  370:   const verifier = base64url(randomBytes(64));
+  371:   const challenge = base64url(createHash("sha256").update(verifier).digest());
+  372:   return { verifier, challenge };
+  373: }
+  374: 
+  375: function convexAdminClient(): ConvexHttpClient | null {
+  376:   if (!env.CONVEX_URL || !env.CONVEX_ADMIN_KEY) {
+  377:     return null;
+  378:   }
+  379:   const client = new ConvexHttpClient(env.CONVEX_URL);
+  380:   (client as unknown as { setAdminAuth: (token: string) => void }).setAdminAuth(env.CONVEX_ADMIN_KEY);
+  381:   return client;
+  382: }
+  383: 
+  384: async function storeProviderTokens(provider: OAuthProvider, tokenResponse: {
+  385:   access_token: string;
+  386:   refresh_token?: string;
+  387:   expires_in?: number;
+  388:   token_type?: string;
+  389:   scope?: string;
+  390:   account_email?: string;
+  391: }): Promise<void> {
+  392:   const client = convexAdminClient();
+  393:   if (!client) {
+  394:     throw new Error("Convex admin client is not configured");
+  395:   }
+  396: 
+  397:   await (client as unknown as { mutation: (name: string, args: unknown) => Promise<unknown> }).mutation(
+  398:     "oauth:upsertProviderTokens",
+  399:     {
+  400:       provider,
+  401:       subject: "system",
+  402:       accountEmail: tokenResponse.account_email,
+  403:       tokenType: tokenResponse.token_type,
+  404:       scope: tokenResponse.scope,
+  405:       accessTokenEncrypted: encryptString(tokenResponse.access_token, env.OAUTH_ENCRYPTION_KEY),
+  406:       refreshTokenEncrypted: tokenResponse.refresh_token
+  407:         ? encryptString(tokenResponse.refresh_token, env.OAUTH_ENCRYPTION_KEY)
+  408:         : undefined,
+  409:       expiresAt: typeof tokenResponse.expires_in === "number" ? Date.now() + tokenResponse.expires_in * 1000 : undefined
+  410:     }
+  411:   );
+  412: }
+  413: 
+  414: async function exchangeOAuthCode(
+  415:   provider: OAuthProvider,
+  416:   state: string,
+  417:   code: string
+  418: ): Promise<void> {
+  419:   const cfg = oauthProviderConfig(provider);
+  420:   if (!cfg) {
+  421:     throw new Error(`OAuth client not configured for provider: ${provider}`);
+  422:   }
+  423: 
+  424:   const pendingRaw = await redis.get(oauthPendingKey(provider, state));
+  425:   if (!pendingRaw) {
+  426:     throw new Error("OAuth state is missing or expired");
+  427:   }
+  428: 
+  429:   const pending = JSON.parse(pendingRaw) as { verifier?: string };
+  430:   if (!pending.verifier) {
+  431:     throw new Error("OAuth PKCE verifier is missing");
+  432:   }
+  433: 
+  434:   const params = new URLSearchParams({
+  435:     grant_type: "authorization_code",
+  436:     code,
+  437:     redirect_uri: oauthRedirectUri(provider),
+  438:     client_id: cfg.clientId,
+  439:     code_verifier: pending.verifier
+  440:   });
+  441: 
+  442:   if (cfg.clientSecret) {
+  443:     params.set("client_secret", cfg.clientSecret);
+  444:   }
+  445: 
+  446:   const tokenRes = await fetch(cfg.tokenUrl, {
+  447:     method: "POST",
+  448:     headers: {
+  449:       "Content-Type": "application/x-www-form-urlencoded",
+  450:       Accept: "application/json"
+  451:     },
+  452:     body: params.toString()
+  453:   });
+  454: 
+  455:   const tokenBody = (await tokenRes.json().catch(() => ({}))) as Record<string, unknown>;
+  456:   if (!tokenRes.ok) {
+  457:     throw new Error(`OAuth token exchange failed (${tokenRes.status})`);
+  458:   }
+  459: 
+  460:   const accessToken = typeof tokenBody.access_token === "string" ? tokenBody.access_token : "";
+  461:   if (!accessToken) {
+  462:     throw new Error("OAuth token response missing access_token");
+  463:   }
+  464: 
+  465:   await storeProviderTokens(provider, {
+  466:     access_token: accessToken,
+  467:     refresh_token: typeof tokenBody.refresh_token === "string" ? tokenBody.refresh_token : undefined,
+  468:     expires_in: typeof tokenBody.expires_in === "number" ? tokenBody.expires_in : undefined,
+  469:     token_type: typeof tokenBody.token_type === "string" ? tokenBody.token_type : undefined,
+  470:     scope: typeof tokenBody.scope === "string" ? tokenBody.scope : undefined,
+  471:     account_email: typeof tokenBody.email === "string" ? tokenBody.email : undefined
+  472:   });
+  473: 
+  474:   await redis.del(oauthPendingKey(provider, state));
+  475: }
+  476: 
+  477: async function syncSessionAccess(token: string, session: SessionRecord): Promise<SessionRecord> {
+  478:   let allowlisted = session.accessGranted === "true";
+  479:   try {
+  480:     allowlisted = await isAllowlistedEmail(session.email);
+  481:   } catch (error) {
+  482:     logger.warn({ error, email: session.email }, "allowlist check failed; preserving current session access state");
+  483:   }
+  484:   const expectedAccess = allowlisted ? "true" : "false";
+  485:   const expectedRole = allowlisted ? "user" : "pending";
+  486: 
+  487:   if (session.accessGranted !== expectedAccess || session.role !== expectedRole) {
+  488:     await redis.hset(`${AUTH_SESSION_PREFIX}${token}`, {
+  489:       accessGranted: expectedAccess,
+  490:       role: expectedRole,
+  491:       updatedAt: Date.now()
+  492:     });
+  493:     return {
+  494:       ...session,
+  495:       accessGranted: expectedAccess,
+  496:       role: expectedRole
+  497:     };
+  498:   }
+  499: 
+  500:   return session;
+  501: }
+  502: 
+  503: async function requireSession(
+  504:   request: { headers: { authorization?: string } },
+  505:   reply: { status: (code: number) => { send: (body: unknown) => unknown } },
+  506:   options: { allowPending?: boolean } = {}
+  507: ) {
+  508:   const token = bearerToken(request.headers.authorization);
+  509:   if (!token) {
+  510:     reply.status(401).send({ detail: "Unauthorized" });
+  511:     return null;
+  512:   }
+  513: 
+  514:   const sessionRaw = (await readSession(token)) as SessionRecord | null;
+  515:   const session = sessionRaw ? await syncSessionAccess(token, sessionRaw) : null;
+  516:   if (!session) {
+  517:     reply.status(401).send({ detail: "Unauthorized" });
+  518:     return null;
+  519:   }
+  520: 
+  521:   if (!options.allowPending && session.accessGranted !== "true") {
+  522:     reply.status(403).send({ detail: "Access not granted" });
+  523:     return null;
+  524:   }
+  525: 
+  526:   return { token, session };
+  527: }
+  528: 
+  529: function latestUserText(messages: Array<{ role: string; content: string }>): string {
+  530:   for (let i = messages.length - 1; i >= 0; i -= 1) {
+  531:     const msg = messages[i];
+  532:     if (msg.role === "user" && typeof msg.content === "string") {
+  533:       return msg.content;
+  534:     }
+  535:   }
+  536:   return "";
+  537: }
+  538: 
+  539: function extractUrls(text: string): string[] {
+  540:   const matches = text.match(/https?:\/\/[^\s)]+/g) ?? [];
+  541:   return [...new Set(matches)].slice(0, 2);
+  542: }
+  543: 
+  544: function stripHtmlToText(html: string): string {
+  545:   return html
+  546:     .replace(/<script[\s\S]*?<\/script>/gi, " ")
+  547:     .replace(/<style[\s\S]*?<\/style>/gi, " ")
+  548:     .replace(/<[^>]+>/g, " ")
+  549:     .replace(/\s+/g, " ")
+  550:     .trim();
+  551: }
+  552: 
+  553: async function tavilySearchContext(query: string): Promise<string | null> {
+  554:   if (!env.TAVILY_API_KEY || !query.trim()) {
+  555:     return null;
+  556:   }
+  557: 
+  558:   try {
+  559:     const res = await fetch("https://api.tavily.com/search", {
+  560:       method: "POST",
+  561:       headers: {
+  562:         "Content-Type": "application/json"
+  563:       },
+  564:       body: JSON.stringify({
+  565:         api_key: env.TAVILY_API_KEY,
+  566:         query,
+  567:         search_depth: "basic",
+  568:         max_results: 4
+  569:       })
+  570:     });
+  571: 
+  572:     if (!res.ok) {
+  573:       return null;
+  574:     }
+  575: 
+  576:     const body = (await res.json()) as {
+  577:       results?: Array<{ title?: string; url?: string; content?: string }>;
+  578:     };
+  579: 
+  580:     const lines = (body.results ?? []).map((r, idx) =>
+  581:       `${idx + 1}. ${r.title ?? "Untitled"}\nURL: ${r.url ?? "n/a"}\nSummary: ${(r.content ?? "").slice(0, 300)}`
+  582:     );
+  583: 
+  584:     return lines.length > 0 ? `Web search results:\n${lines.join("\n\n")}` : null;
+  585:   } catch {
+  586:     return null;
+  587:   }
+  588: }
+  589: 
+  590: async function urlFetchContext(text: string): Promise<string | null> {
+  591:   const urls = extractUrls(text);
+  592:   if (urls.length === 0) return null;
+  593: 
+  594:   const contexts: string[] = [];
+  595:   for (const url of urls) {
+  596:     try {
+  597:       const res = await fetch(url, { headers: { "User-Agent": "SuperhumanBot/0.1" } });
+  598:       if (!res.ok) continue;
+  599:       const raw = await res.text();
+  600:       const cleaned = stripHtmlToText(raw).slice(0, 1000);
+  601:       contexts.push(`Fetched URL: ${url}\nContent snippet: ${cleaned}`);
+  602:     } catch {
+  603:       // best-effort fetch
+  604:     }
+  605:   }
+  606: 
+  607:   return contexts.length > 0 ? contexts.join("\n\n") : null;
+  608: }
+  609: 
+  610: async function isAllowlistedEmail(email: string): Promise<boolean> {
+  611:   const client = convexAdminClient();
+  612:   if (!client) {
+  613:     // In local development without Convex configured, allow access.
+  614:     return true;
+  615:   }
+  616: 
+  617:   const normalized = normalizeEmail(email);
+  618:   const cached = allowlistCache.get(normalized);
+  619:   if (cached && cached.expiresAt > Date.now()) {
+  620:     return cached.allowed;
+  621:   }
+  622: 
+  623:   try {
+  624:     const result = (await (client as unknown as { query: (name: string, args: unknown) => Promise<unknown> }).query(
+  625:       "allowlist:isAllowed",
+  626:       { email: normalized }
+  627:     )) as { allowed?: boolean };
+  628:     const allowed = result.allowed === true;
+  629:     allowlistCache.set(normalized, { allowed, expiresAt: Date.now() + ALLOWLIST_CACHE_TTL_MS });
+  630:     return allowed;
+  631:   } catch {
+  632:     const allowedUsers = (await (client as unknown as { query: (name: string, args: unknown) => Promise<unknown> }).query(
+  633:       "allowlist:list",
+  634:       {}
+  635:     )) as Array<{ email: string }>;
+  636:     const allowed = allowedUsers.some((row) => row.email === normalized);
+  637:     allowlistCache.set(normalized, { allowed, expiresAt: Date.now() + ALLOWLIST_CACHE_TTL_MS });
+  638:     return allowed;
+  639:   }
+  640: }
+  641: 
+  642: async function getAllowlistedForAuth(email: string): Promise<boolean> {
+  643:   try {
+  644:     return await isAllowlistedEmail(email);
+  645:   } catch (error) {
+  646:     logger.error({ error, email }, "allowlist lookup failed during auth; defaulting to denied access");
+  647:     return false;
+  648:   }
+  649: }
+  650: 
+  651: await app.register(cors, {
+  652:   origin: true,
+  653:   credentials: true
+  654: });
+  655: 
+  656: app.get("/api/health", async () => {
+  657:   const redisOk = await redis.ping().then(() => true).catch(() => false);
+  658:   return {
+  659:     ok: redisOk,
+  660:     service: "superhuman-web",
+  661:     timestamp: new Date().toISOString(),
+  662:     redisOk
+  663:   };
+  664: });
+  665: 
+  666: app.get("/api/config", async () => {
+  667:   return {
+  668:     status: true,
+  669:     name: "Superhuman",
+  670:     version: "0.1.0",
+  671:     default_locale: "en-US",
+  672:     default_models: ["gpt-5.3-codex"],
+  673:     features: {
+  674:       enable_signup: true,
+  675:       enable_websocket: false,
+  676:       enable_direct_connections: false,
+  677:       enable_message_rating: false,
+  678:       enable_web_search: true,
+  679:       enable_community_sharing: false,
+  680:       enable_channels: false,
+  681:       enable_notes: false,
+  682:       enable_workspace: false,
+  683:       enable_tools: true,
+  684:       enable_tool_servers: false,
+  685:       enable_admin_analytics: false,
+  686:       enable_evaluations: false,
+  687:       enable_admin_export: false,
+  688:       enable_public_active_users_count: false,
+  689:       enable_version_update_check: false,
+  690:       enable_code_execution: false,
+  691:       auth_trusted_header: false,
+  692:       oauth: {
+  693:         providers: ["codex", "qwen"]
+  694:       }
+  695:     }
+  696:   };
+  697: });
+  698: 
+  699: app.get("/api/changelog", async () => ({ changes: [], latest: "0.1.0" }));
+  700: app.get("/api/version", async () => ({ version: "0.1.0", name: "superhuman" }));
+  701: app.get("/api/version/updates", async () => ({ latest: "0.1.0", has_update: false }));
+  702: 
+  703: app.get("/api/v1/auths/signup/enabled", async () => ({ status: true }));
+  704: app.get("/api/v1/auths/signup/user/role", async () => ({ role: "user" }));
+  705: app.get("/api/v1/auths/admin/details", async () => ({ name: "Superhuman Admin", email: "admin@localhost" }));
+  706: app.get("/api/v1/auths/admin/config", async () => ({
+  707:   SHOW_ADMIN_DETAILS: false,
+  708:   ENABLE_SIGNUP: true
+  709: }));
+  710: app.post("/api/v1/auths/admin/config", async () => ({ success: true }));
+  711: app.get("/api/v1/auths/token/expires", async () => ({ expires: 604800 }));
+  712: app.post("/api/v1/auths/token/expires/update", async () => ({ success: true }));
+  713: app.post("/api/v1/auths/update/timezone", async () => ({ success: true }));
+  714: 
+  715: app.post("/api/v1/auths/signup", async (request, reply) => {
+  716:   const body = request.body as { email?: string; password?: string; name?: string };
+  717:   const email = normalizeEmail(body.email ?? "");
+  718:   const password = body.password ?? "";
+  719:   const name = (body.name ?? "User").trim() || "User";
+  720: 
+  721:   if (!email || !password) {
+  722:     return reply.status(400).send({ detail: "Email and password are required" });
+  723:   }
+  724: 
+  725:   const userKey = `${AUTH_USER_PREFIX}${email}`;
+  726:   const existing = await redis.hgetall(userKey);
+  727:   if (existing && Object.keys(existing).length > 0) {
+  728:     return reply.status(400).send({ detail: "User already exists" });
+  729:   }
+  730: 
+  731:   await redis.hset(userKey, {
+  732:     email,
+  733:     passwordHash: hashPassword(password),
+  734:     name,
+  735:     createdAt: Date.now()
+  736:   });
+  737: 
+  738:   const allowlisted = await getAllowlistedForAuth(email);
+  739:   const role = allowlisted ? "user" : "pending";
+  740: 
+  741:   const token = randomUUID().replace(/-/g, "");
+  742:   await redis.hset(`${AUTH_SESSION_PREFIX}${token}`, {
+  743:     id: email,
+  744:     email,
+  745:     name,
+  746:     role,
+  747:     accessGranted: allowlisted ? "true" : "false",
+  748:     createdAt: Date.now()
+  749:   });
+  750:   await redis.expire(`${AUTH_SESSION_PREFIX}${token}`, 60 * 60 * 24 * 7);
+  751: 
+  752:   reply.header("Set-Cookie", sessionCookie(token));
+  753:   return buildSessionUser(
+  754:     {
+  755:       id: email,
+  756:       email,
+  757:       name,
+  758:       role,
+  759:       accessGranted: allowlisted ? "true" : "false"
+  760:     },
+  761:     token
+  762:   );
+  763: });
+  764: 
+  765: app.post("/api/v1/auths/signin", async (request, reply) => {
+  766:   const body = request.body as { email?: string; password?: string };
+  767:   const email = normalizeEmail(body.email ?? "");
+  768:   const password = body.password ?? "";
+  769: 
+  770:   const user = await redis.hgetall(`${AUTH_USER_PREFIX}${email}`);
+  771:   if (!user || Object.keys(user).length === 0) {
+  772:     return reply.status(401).send({ detail: "Invalid credentials" });
+  773:   }
+  774: 
+  775:   const incomingHash = hashPassword(password);
+  776:   if (incomingHash !== user.passwordHash) {
+  777:     return reply.status(401).send({ detail: "Invalid credentials" });
+  778:   }
+  779: 
+  780:   const allowlisted = await getAllowlistedForAuth(email);
+  781:   const role = allowlisted ? "user" : "pending";
+  782: 
+  783:   const token = randomUUID().replace(/-/g, "");
+  784:   await redis.hset(`${AUTH_SESSION_PREFIX}${token}`, {
+  785:     id: email,
+  786:     email,
+  787:     name: user.name ?? email,
+  788:     role,
+  789:     accessGranted: allowlisted ? "true" : "false",
+  790:     createdAt: Date.now()
+  791:   });
+  792:   await redis.expire(`${AUTH_SESSION_PREFIX}${token}`, 60 * 60 * 24 * 7);
+  793: 
+  794:   reply.header("Set-Cookie", sessionCookie(token));
+  795:   return buildSessionUser(
+  796:     {
+  797:       id: email,
+  798:       email,
+  799:       name: user.name ?? email,
+  800:       role,
+  801:       accessGranted: allowlisted ? "true" : "false"
+  802:     },
+  803:     token
+  804:   );
+  805: });
+  806: 
+  807: app.get("/api/v1/auths/", async (request, reply) => {
+  808:   const auth = await requireSession(request, reply, { allowPending: true });
+  809:   if (!auth) return;
+  810:   return buildSessionUser(auth.session, auth.token);
+  811: });
+  812: 
+  813: app.get("/api/v1/auths/signout", async (request, reply) => {
+  814:   const token = bearerToken(request.headers.authorization);
+  815:   if (token) {
+  816:     await redis.del(`${AUTH_SESSION_PREFIX}${token}`);
+  817:   }
+  818:   reply.header("Set-Cookie", sessionCookie(null));
+  819:   return { success: true };
+  820: });
+  821: 
+  822: app.get("/api/v1/models", async () => ({ data: listOpenAIStyleModels(env) }));
+  823: app.get("/api/models", async () => ({ data: listOpenAIStyleModels(env) }));
+  824: app.get("/api/v1/models/list", async () => listOpenAIStyleModels(env));
+  825: app.get("/api/v1/models/base", async () => listOpenAIStyleModels(env));
+  826: app.get("/api/v1/models/tags", async () => []);
+  827: app.get("/api/v1/models/model", async (request) => {
+  828:   const id = String((request.query as { id?: string }).id ?? "");
+  829:   const model = listOpenAIStyleModels(env).find((item) => item.id === id);
+  830:   if (!model) {
+  831:     return {};
+  832:   }
+  833:   return model;
+  834: });
+  835: app.get("/api/v1/models/model/profile/image", async (_, reply) => {
+  836:   return reply
+  837:     .type("image/svg+xml")
+  838:     .send(`<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64"><rect width="64" height="64" fill="#0f172a"/><text x="50%" y="54%" dominant-baseline="middle" text-anchor="middle" fill="#e2e8f0" font-size="10">AI</text></svg>`);
+  839: });
+  840: app.get("/api/v1/users/:id/profile/image", async (_, reply) => {
+  841:   return reply
+  842:     .type("image/svg+xml")
+  843:     .send(`<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64"><rect width="64" height="64" fill="#0f172a"/><text x="50%" y="54%" dominant-baseline="middle" text-anchor="middle" fill="#e2e8f0" font-size="10">U</text></svg>`);
+  844: });
+  845: app.get("/api/v1/tools/", async () => [
+  846:   {
+  847:     id: "builtin.web_search",
+  848:     name: "Web Search",
+  849:     meta: {
+  850:       description: "Search the web for current information using Tavily when configured."
+  851:     }
+  852:   },
+  853:   {
+  854:     id: "builtin.web_fetch",
+  855:     name: "Web Fetch",
+  856:     meta: {
+  857:       description: "Fetch and summarize URL content referenced in the prompt."
+  858:     }
+  859:   }
+  860: ]);
+  861: app.get("/api/v1/tools/list", async () => [
+  862:   {
+  863:     id: "builtin.web_search",
+  864:     name: "Web Search",
+  865:     meta: {
+  866:       description: "Search the web for current information using Tavily when configured."
+  867:     }
+  868:   },
+  869:   {
+  870:     id: "builtin.web_fetch",
+  871:     name: "Web Fetch",
+  872:     meta: {
+  873:       description: "Fetch and summarize URL content referenced in the prompt."
+  874:     }
+  875:   }
+  876: ]);
+  877: app.get("/api/v1/functions/", async () => []);
+  878: app.get("/api/v1/functions/list", async () => []);
+  879: app.get("/api/v1/configs/tool_servers", async () => []);
+  880: app.post("/api/v1/configs/tool_servers/verify", async () => ({ ok: false, detail: "Tool servers disabled" }));
+  881: app.get("/api/v1/configs/banners", async () => []);
+  882: app.get("/api/v1/users/user/settings", async () => ({ ui: {} }));
+  883: app.post("/api/v1/users/user/settings/update", async () => ({ success: true }));
+  884: app.get("/api/v1/users/user/info", async (request, reply) => {
+  885:   const auth = await requireSession(request, reply, { allowPending: true });
+  886:   if (!auth) return;
+  887:   return buildSessionUser(auth.session, auth.token);
+  888: });
+  889: app.post("/api/v1/users/user/info/update", async () => ({ success: true }));
+  890: app.post("/api/v1/users/user/status/update", async () => ({ success: true }));
+  891: 
+  892: function chatListRow(chat: ChatRecord) {
+  893:   return {
+  894:     id: chat.id,
+  895:     title: chat.title,
+  896:     created_at: chat.created_at,
+  897:     updated_at: chat.updated_at,
+  898:     folder_id: chat.folder_id,
+  899:     pinned: chat.pinned,
+  900:     archived: chat.archived,
+  901:     share_id: chat.share_id
+  902:   };
+  903: }
+  904: 
+  905: app.post("/api/v1/chats/new", async (request, reply) => {
+  906:   const auth = await requireSession(request, reply);
+  907:   if (!auth) return;
+  908: 
+  909:   const body = request.body as { chat?: unknown; folder_id?: string | null };
+  910:   const chatPayload = isRecord(body.chat) ? body.chat : {};
+  911:   const chatId = textOr(chatPayload.id, randomUUID());
+  912:   const now = nowUnixSeconds();
+  913:   const title = buildChatTitle(chatPayload, "New Chat");
+  914: 
+  915:   const chatRecord = normalizeChatRecord(auth.session.id, {
+  916:     id: chatId,
+  917:     title,
+  918:     chat: { ...chatPayload, id: chatId, title },
+  919:     folder_id: body.folder_id ?? null,
+  920:     created_at: toUnixSeconds(chatPayload.created_at, now),
+  921:     updated_at: now
+  922:   });
+  923: 
+  924:   const chats = await loadChats(auth.session.id);
+  925:   const withoutExisting = chats.filter((chat) => chat.id !== chatId);
+  926:   await saveChats(auth.session.id, [chatRecord, ...withoutExisting]);
+  927:   return chatRecord;
+  928: });
+  929: 
+  930: app.post("/api/v1/chats/import", async (request, reply) => {
+  931:   const auth = await requireSession(request, reply);
+  932:   if (!auth) return;
+  933: 
+  934:   const body = request.body as { chats?: unknown[] };
+  935:   const incoming = Array.isArray(body.chats) ? body.chats : [];
+  936:   const now = nowUnixSeconds();
+  937:   const existing = await loadChats(auth.session.id);
+  938:   const byId = new Map<string, ChatRecord>(existing.map((chat) => [chat.id, chat]));
+  939:   const imported: ChatRecord[] = [];
+  940: 
+  941:   for (const row of incoming) {
+  942:     if (!isRecord(row)) continue;
+  943:     const chatPayload = isRecord(row.chat) ? row.chat : {};
+  944:     const id = textOr(chatPayload.id, randomUUID());
+  945:     const title = buildChatTitle(chatPayload, "Imported Chat");
+  946: 
+  947:     const merged = normalizeChatRecord(auth.session.id, {
+  948:       ...(byId.get(id) ?? {}),
+  949:       id,
+  950:       title,
+  951:       chat: { ...chatPayload, id, title },
+  952:       meta: isRecord(row.meta) ? row.meta : {},
+  953:       folder_id: typeof row.folder_id === "string" ? row.folder_id : null,
+  954:       pinned: Boolean(row.pinned),
+  955:       created_at: toUnixSeconds(row.created_at, now),
+  956:       updated_at: toUnixSeconds(row.updated_at, now)
+  957:     });
+  958: 
+  959:     byId.set(id, merged);
+  960:     imported.push(merged);
+  961:   }
+  962: 
+  963:   const chats = [...byId.values()].sort((a, b) => b.updated_at - a.updated_at);
+  964:   await saveChats(auth.session.id, chats);
+  965:   return imported;
+  966: });
+  967: 
+  968: app.get("/api/v1/chats/", async (request, reply) => {
+  969:   const auth = await requireSession(request, reply);
+  970:   if (!auth) return;
+  971: 
+  972:   const query = request.query as { page?: string; include_pinned?: string; include_folders?: string };
+  973:   const page = Math.max(1, Number(query.page ?? "1") || 1);
+  974:   const includePinned = query.include_pinned === "true";
+  975:   const includeFolders = query.include_folders === "true";
+  976:   const pageSize = 40;
+  977: 
+  978:   const chats = (await loadChats(auth.session.id))
+  979:     .filter((chat) => !chat.archived)
+  980:     .filter((chat) => (includePinned ? true : !chat.pinned))
+  981:     .filter((chat) => (includeFolders ? true : !chat.folder_id))
+  982:     .sort((a, b) => b.updated_at - a.updated_at);
+  983: 
+  984:   return chats.slice((page - 1) * pageSize, page * pageSize).map(chatListRow);
+  985: });
+  986: 
+  987: app.get("/api/v1/chats/pinned", async (request, reply) => {
+  988:   const auth = await requireSession(request, reply);
+  989:   if (!auth) return;
+  990: 
+  991:   return (await loadChats(auth.session.id))
+  992:     .filter((chat) => chat.pinned && !chat.archived)
+  993:     .sort((a, b) => b.updated_at - a.updated_at)
+  994:     .map(chatListRow);
+  995: });
+  996: 
+  997: app.get("/api/v1/chats/all", async (request, reply) => {
+  998:   const auth = await requireSession(request, reply);
+  999:   if (!auth) return;
+ 1000:   return (await loadChats(auth.session.id)).map(chatListRow);
+ 1001: });
+ 1002: 
+ 1003: app.get("/api/v1/chats/all/db", async (request, reply) => {
+ 1004:   const auth = await requireSession(request, reply);
+ 1005:   if (!auth) return;
+ 1006:   return await loadChats(auth.session.id);
+ 1007: });
+ 1008: 
+ 1009: app.get("/api/v1/chats/archived", async (request, reply) => {
+ 1010:   const auth = await requireSession(request, reply);
+ 1011:   if (!auth) return;
+ 1012: 
+ 1013:   const query = request.query as { page?: string };
+ 1014:   const page = Math.max(1, Number(query.page ?? "1") || 1);
+ 1015:   const pageSize = 40;
+ 1016: 
+ 1017:   const rows = (await loadChats(auth.session.id))
+ 1018:     .filter((chat) => chat.archived)
+ 1019:     .sort((a, b) => b.updated_at - a.updated_at)
+ 1020:     .map(chatListRow);
+ 1021: 
+ 1022:   return rows.slice((page - 1) * pageSize, page * pageSize);
+ 1023: });
+ 1024: 
+ 1025: app.get("/api/v1/chats/all/archived", async (request, reply) => {
+ 1026:   const auth = await requireSession(request, reply);
+ 1027:   if (!auth) return;
+ 1028:   return (await loadChats(auth.session.id)).filter((chat) => chat.archived).map(chatListRow);
+ 1029: });
+ 1030: 
+ 1031: app.get("/api/v1/chats/shared", async (request, reply) => {
+ 1032:   const auth = await requireSession(request, reply);
+ 1033:   if (!auth) return;
+ 1034:   return (await loadChats(auth.session.id))
+ 1035:     .filter((chat) => Boolean(chat.share_id))
+ 1036:     .sort((a, b) => b.updated_at - a.updated_at)
+ 1037:     .map(chatListRow);
+ 1038: });
+ 1039: 
+ 1040: app.get("/api/v1/chats/all/tags", async (request, reply) => {
+ 1041:   const auth = await requireSession(request, reply);
+ 1042:   if (!auth) return;
+ 1043: 
+ 1044:   const counter = new Map<string, number>();
+ 1045:   for (const chat of await loadChats(auth.session.id)) {
+ 1046:     for (const tag of chat.tags) {
+ 1047:       counter.set(tag.name, (counter.get(tag.name) ?? 0) + 1);
+ 1048:     }
+ 1049:   }
+ 1050: 
+ 1051:   return [...counter.entries()]
+ 1052:     .sort((a, b) => a[0].localeCompare(b[0]))
+ 1053:     .map(([name, count]) => ({ name, count }));
+ 1054: });
+ 1055: 
+ 1056: app.get("/api/v1/chats/search", async (request, reply) => {
+ 1057:   const auth = await requireSession(request, reply);
+ 1058:   if (!auth) return;
+ 1059: 
+ 1060:   const query = request.query as { text?: string; page?: string };
+ 1061:   const text = (query.text ?? "").toLowerCase();
+ 1062:   const page = Math.max(1, Number(query.page ?? "1") || 1);
+ 1063:   const pageSize = 40;
+ 1064: 
+ 1065:   const rows = (await loadChats(auth.session.id))
+ 1066:     .filter((chat) => !chat.archived)
+ 1067:     .filter((chat) => chat.title.toLowerCase().includes(text))
+ 1068:     .sort((a, b) => b.updated_at - a.updated_at)
+ 1069:     .map(chatListRow);
+ 1070: 
+ 1071:   return rows.slice((page - 1) * pageSize, page * pageSize);
+ 1072: });
+ 1073: 
+ 1074: app.post("/api/v1/chats/tags", async (request, reply) => {
+ 1075:   const auth = await requireSession(request, reply);
+ 1076:   if (!auth) return;
+ 1077: 
+ 1078:   const body = request.body as { name?: string };
+ 1079:   const name = textOr(body.name, "").toLowerCase();
+ 1080:   if (!name) {
+ 1081:     return [];
+ 1082:   }
+ 1083: 
+ 1084:   return (await loadChats(auth.session.id))
+ 1085:     .filter((chat) => chat.tags.some((tag) => tag.name.toLowerCase() === name))
+ 1086:     .sort((a, b) => b.updated_at - a.updated_at)
+ 1087:     .map(chatListRow);
+ 1088: });
+ 1089: 
+ 1090: app.get("/api/v1/chats/folder/:folderId", async (request, reply) => {
+ 1091:   const auth = await requireSession(request, reply);
+ 1092:   if (!auth) return;
+ 1093:   const folderId = (request.params as { folderId: string }).folderId;
+ 1094:   return (await loadChats(auth.session.id))
+ 1095:     .filter((chat) => chat.folder_id === folderId)
+ 1096:     .sort((a, b) => b.updated_at - a.updated_at);
+ 1097: });
+ 1098: 
+ 1099: app.get("/api/v1/chats/folder/:folderId/list", async (request, reply) => {
+ 1100:   const auth = await requireSession(request, reply);
+ 1101:   if (!auth) return;
+ 1102: 
+ 1103:   const folderId = (request.params as { folderId: string }).folderId;
+ 1104:   const query = request.query as { page?: string };
+ 1105:   const page = Math.max(1, Number(query.page ?? "1") || 1);
+ 1106:   const pageSize = 40;
+ 1107: 
+ 1108:   const rows = (await loadChats(auth.session.id))
+ 1109:     .filter((chat) => chat.folder_id === folderId)
+ 1110:     .sort((a, b) => b.updated_at - a.updated_at)
+ 1111:     .map(chatListRow);
+ 1112: 
+ 1113:   return rows.slice((page - 1) * pageSize, page * pageSize);
+ 1114: });
+ 1115: 
+ 1116: app.post("/api/v1/chats/archive/all", async (request, reply) => {
+ 1117:   const auth = await requireSession(request, reply);
+ 1118:   if (!auth) return;
+ 1119: 
+ 1120:   const now = nowUnixSeconds();
+ 1121:   const chats = (await loadChats(auth.session.id)).map((chat) => ({ ...chat, archived: true, updated_at: now }));
+ 1122:   await saveChats(auth.session.id, chats);
+ 1123:   return { success: true };
+ 1124: });
+ 1125: 
+ 1126: app.post("/api/v1/chats/unarchive/all", async (request, reply) => {
+ 1127:   const auth = await requireSession(request, reply);
+ 1128:   if (!auth) return;
+ 1129: 
+ 1130:   const now = nowUnixSeconds();
+ 1131:   const chats = (await loadChats(auth.session.id)).map((chat) => ({ ...chat, archived: false, updated_at: now }));
+ 1132:   await saveChats(auth.session.id, chats);
+ 1133:   return { success: true };
+ 1134: });
+ 1135: 
+ 1136: app.get("/api/v1/chats/list/user/:userId", async (request, reply) => {
+ 1137:   const auth = await requireSession(request, reply);
+ 1138:   if (!auth) return;
+ 1139:   const userId = (request.params as { userId: string }).userId;
+ 1140:   if (userId !== auth.session.id) {
+ 1141:     return reply.status(403).send({ detail: "Forbidden" });
+ 1142:   }
+ 1143:   return (await loadChats(auth.session.id)).map(chatListRow);
+ 1144: });
+ 1145: 
+ 1146: app.get("/api/v1/chats/share/:shareId", async (request, reply) => {
+ 1147:   const auth = await requireSession(request, reply);
+ 1148:   if (!auth) return;
+ 1149:   const shareId = (request.params as { shareId: string }).shareId;
+ 1150:   const chat = (await loadChats(auth.session.id)).find((x) => x.share_id === shareId);
+ 1151:   if (!chat) {
+ 1152:     return reply.status(404).send({ detail: "Chat not found" });
+ 1153:   }
+ 1154:   return chat;
+ 1155: });
+ 1156: 
+ 1157: app.get("/api/v1/chats/:id/pinned", async (request, reply) => {
+ 1158:   const auth = await requireSession(request, reply);
+ 1159:   if (!auth) return;
+ 1160:   const id = (request.params as { id: string }).id;
+ 1161:   const chat = (await loadChats(auth.session.id)).find((x) => x.id === id);
+ 1162:   if (!chat) {
+ 1163:     return reply.status(404).send({ detail: "Chat not found" });
+ 1164:   }
+ 1165:   return { pinned: chat.pinned };
+ 1166: });
+ 1167: 
+ 1168: app.post("/api/v1/chats/:id/pin", async (request, reply) => {
+ 1169:   const auth = await requireSession(request, reply);
+ 1170:   if (!auth) return;
+ 1171:   const id = (request.params as { id: string }).id;
+ 1172:   const now = nowUnixSeconds();
+ 1173:   const chats = await loadChats(auth.session.id);
+ 1174:   const idx = chats.findIndex((x) => x.id === id);
+ 1175:   if (idx === -1) {
+ 1176:     return reply.status(404).send({ detail: "Chat not found" });
+ 1177:   }
+ 1178:   chats[idx] = { ...chats[idx], pinned: !chats[idx].pinned, updated_at: now };
+ 1179:   await saveChats(auth.session.id, chats);
+ 1180:   return chats[idx];
+ 1181: });
+ 1182: 
+ 1183: app.post("/api/v1/chats/:id/folder", async (request, reply) => {
+ 1184:   const auth = await requireSession(request, reply);
+ 1185:   if (!auth) return;
+ 1186:   const id = (request.params as { id: string }).id;
+ 1187:   const body = request.body as { folder_id?: string };
+ 1188:   const now = nowUnixSeconds();
+ 1189:   const chats = await loadChats(auth.session.id);
+ 1190:   const idx = chats.findIndex((x) => x.id === id);
+ 1191:   if (idx === -1) {
+ 1192:     return reply.status(404).send({ detail: "Chat not found" });
+ 1193:   }
+ 1194:   chats[idx] = {
+ 1195:     ...chats[idx],
+ 1196:     folder_id: typeof body.folder_id === "string" ? body.folder_id : null,
+ 1197:     updated_at: now
+ 1198:   };
+ 1199:   await saveChats(auth.session.id, chats);
+ 1200:   return chats[idx];
+ 1201: });
+ 1202: 
+ 1203: app.post("/api/v1/chats/:id/archive", async (request, reply) => {
+ 1204:   const auth = await requireSession(request, reply);
+ 1205:   if (!auth) return;
+ 1206:   const id = (request.params as { id: string }).id;
+ 1207:   const chats = await loadChats(auth.session.id);
+ 1208:   const idx = chats.findIndex((x) => x.id === id);
+ 1209:   if (idx === -1) {
+ 1210:     return reply.status(404).send({ detail: "Chat not found" });
+ 1211:   }
+ 1212:   chats[idx] = { ...chats[idx], archived: true, updated_at: nowUnixSeconds() };
+ 1213:   await saveChats(auth.session.id, chats);
+ 1214:   return chats[idx];
+ 1215: });
+ 1216: 
+ 1217: app.post("/api/v1/chats/:id/clone", async (request, reply) => {
+ 1218:   const auth = await requireSession(request, reply);
+ 1219:   if (!auth) return;
+ 1220:   const id = (request.params as { id: string }).id;
+ 1221:   const body = request.body as { title?: string };
+ 1222:   const chats = await loadChats(auth.session.id);
+ 1223:   const source = chats.find((x) => x.id === id);
+ 1224:   if (!source) {
+ 1225:     return reply.status(404).send({ detail: "Chat not found" });
+ 1226:   }
+ 1227: 
+ 1228:   const newId = randomUUID();
+ 1229:   const now = nowUnixSeconds();
+ 1230:   const cloned = normalizeChatRecord(auth.session.id, {
+ 1231:     ...source,
+ 1232:     id: newId,
+ 1233:     title: textOr(body.title, `Clone of ${source.title}`),
+ 1234:     pinned: false,
+ 1235:     share_id: null,
+ 1236:     created_at: now,
+ 1237:     updated_at: now,
+ 1238:     chat: {
+ 1239:       ...(source.chat ?? {}),
+ 1240:       id: newId,
+ 1241:       title: textOr(body.title, `Clone of ${source.title}`)
+ 1242:     }
+ 1243:   });
+ 1244: 
+ 1245:   await saveChats(auth.session.id, [cloned, ...chats]);
+ 1246:   return cloned;
+ 1247: });
+ 1248: 
+ 1249: app.post("/api/v1/chats/:id/clone/shared", async (request, reply) => {
+ 1250:   const auth = await requireSession(request, reply);
+ 1251:   if (!auth) return;
+ 1252:   const id = (request.params as { id: string }).id;
+ 1253:   const chats = await loadChats(auth.session.id);
+ 1254:   const source = chats.find((x) => x.id === id);
+ 1255:   if (!source) {
+ 1256:     return reply.status(404).send({ detail: "Chat not found" });
+ 1257:   }
+ 1258: 
+ 1259:   const newId = randomUUID();
+ 1260:   const now = nowUnixSeconds();
+ 1261:   const cloned = normalizeChatRecord(auth.session.id, {
+ 1262:     ...source,
+ 1263:     id: newId,
+ 1264:     pinned: false,
+ 1265:     share_id: null,
+ 1266:     created_at: now,
+ 1267:     updated_at: now,
+ 1268:     chat: {
+ 1269:       ...(source.chat ?? {}),
+ 1270:       id: newId
+ 1271:     }
+ 1272:   });
+ 1273: 
+ 1274:   await saveChats(auth.session.id, [cloned, ...chats]);
+ 1275:   return cloned;
+ 1276: });
+ 1277: 
+ 1278: app.post("/api/v1/chats/:id/share", async (request, reply) => {
+ 1279:   const auth = await requireSession(request, reply);
+ 1280:   if (!auth) return;
+ 1281:   const id = (request.params as { id: string }).id;
+ 1282:   const chats = await loadChats(auth.session.id);
+ 1283:   const idx = chats.findIndex((x) => x.id === id);
+ 1284:   if (idx === -1) {
+ 1285:     return reply.status(404).send({ detail: "Chat not found" });
+ 1286:   }
+ 1287:   const shareId = randomUUID().replace(/-/g, "");
+ 1288:   chats[idx] = { ...chats[idx], share_id: shareId, updated_at: nowUnixSeconds() };
+ 1289:   await saveChats(auth.session.id, chats);
+ 1290:   return chats[idx];
+ 1291: });
+ 1292: 
+ 1293: app.delete("/api/v1/chats/:id/share", async (request, reply) => {
+ 1294:   const auth = await requireSession(request, reply);
+ 1295:   if (!auth) return;
+ 1296:   const id = (request.params as { id: string }).id;
+ 1297:   const chats = await loadChats(auth.session.id);
+ 1298:   const idx = chats.findIndex((x) => x.id === id);
+ 1299:   if (idx === -1) {
+ 1300:     return reply.status(404).send({ detail: "Chat not found" });
+ 1301:   }
+ 1302:   chats[idx] = { ...chats[idx], share_id: null, updated_at: nowUnixSeconds() };
+ 1303:   await saveChats(auth.session.id, chats);
+ 1304:   return chats[idx];
+ 1305: });
+ 1306: 
+ 1307: app.get("/api/v1/chats/:id/tags", async (request, reply) => {
+ 1308:   const auth = await requireSession(request, reply);
+ 1309:   if (!auth) return;
+ 1310:   const id = (request.params as { id: string }).id;
+ 1311:   const chat = (await loadChats(auth.session.id)).find((x) => x.id === id);
+ 1312:   if (!chat) {
+ 1313:     return reply.status(404).send({ detail: "Chat not found" });
+ 1314:   }
+ 1315:   return chat.tags;
+ 1316: });
+ 1317: 
+ 1318: app.post("/api/v1/chats/:id/tags", async (request, reply) => {
+ 1319:   const auth = await requireSession(request, reply);
+ 1320:   if (!auth) return;
+ 1321:   const id = (request.params as { id: string }).id;
+ 1322:   const body = request.body as { name?: string };
+ 1323:   const name = textOr(body.name, "");
+ 1324:   if (!name) {
+ 1325:     return [];
+ 1326:   }
+ 1327: 
+ 1328:   const chats = await loadChats(auth.session.id);
+ 1329:   const idx = chats.findIndex((x) => x.id === id);
+ 1330:   if (idx === -1) {
+ 1331:     return reply.status(404).send({ detail: "Chat not found" });
+ 1332:   }
+ 1333: 
+ 1334:   const tags = normalizeTags([...(chats[idx].tags ?? []), { name }]);
+ 1335:   chats[idx] = { ...chats[idx], tags, updated_at: nowUnixSeconds() };
+ 1336:   await saveChats(auth.session.id, chats);
+ 1337:   return tags;
+ 1338: });
+ 1339: 
+ 1340: app.delete("/api/v1/chats/:id/tags", async (request, reply) => {
+ 1341:   const auth = await requireSession(request, reply);
+ 1342:   if (!auth) return;
+ 1343:   const id = (request.params as { id: string }).id;
+ 1344:   const body = request.body as { name?: string };
+ 1345:   const name = textOr(body.name, "").toLowerCase();
+ 1346: 
+ 1347:   const chats = await loadChats(auth.session.id);
+ 1348:   const idx = chats.findIndex((x) => x.id === id);
+ 1349:   if (idx === -1) {
+ 1350:     return reply.status(404).send({ detail: "Chat not found" });
+ 1351:   }
+ 1352: 
+ 1353:   const tags = chats[idx].tags.filter((tag) => tag.name.toLowerCase() !== name);
+ 1354:   chats[idx] = { ...chats[idx], tags, updated_at: nowUnixSeconds() };
+ 1355:   await saveChats(auth.session.id, chats);
+ 1356:   return tags;
+ 1357: });
+ 1358: 
+ 1359: app.delete("/api/v1/chats/:id/tags/all", async (request, reply) => {
+ 1360:   const auth = await requireSession(request, reply);
+ 1361:   if (!auth) return;
+ 1362:   const id = (request.params as { id: string }).id;
+ 1363:   const chats = await loadChats(auth.session.id);
+ 1364:   const idx = chats.findIndex((x) => x.id === id);
+ 1365:   if (idx === -1) {
+ 1366:     return reply.status(404).send({ detail: "Chat not found" });
+ 1367:   }
+ 1368: 
+ 1369:   chats[idx] = { ...chats[idx], tags: [], updated_at: nowUnixSeconds() };
+ 1370:   await saveChats(auth.session.id, chats);
+ 1371:   return [];
+ 1372: });
+ 1373: 
+ 1374: app.get("/api/v1/chats/:id", async (request, reply) => {
+ 1375:   const auth = await requireSession(request, reply);
+ 1376:   if (!auth) return;
+ 1377:   const id = (request.params as { id: string }).id;
+ 1378:   const chat = (await loadChats(auth.session.id)).find((x) => x.id === id);
+ 1379:   if (!chat) {
+ 1380:     return reply.status(404).send({ detail: "Chat not found" });
+ 1381:   }
+ 1382:   return chat;
+ 1383: });
+ 1384: 
+ 1385: app.post("/api/v1/chats/:id", async (request, reply) => {
+ 1386:   const auth = await requireSession(request, reply);
+ 1387:   if (!auth) return;
+ 1388: 
+ 1389:   const id = (request.params as { id: string }).id;
+ 1390:   const body = request.body as { chat?: unknown };
+ 1391:   if (!isRecord(body.chat)) {
+ 1392:     return reply.status(400).send({ detail: "chat payload is required" });
+ 1393:   }
+ 1394: 
+ 1395:   const chats = await loadChats(auth.session.id);
+ 1396:   const idx = chats.findIndex((x) => x.id === id);
+ 1397:   if (idx === -1) {
+ 1398:     return reply.status(404).send({ detail: "Chat not found" });
+ 1399:   }
+ 1400: 
+ 1401:   const existing = chats[idx];
+ 1402:   const mergedChat = { ...(existing.chat ?? {}), ...body.chat, id };
+ 1403:   const nextTitle = buildChatTitle(mergedChat, existing.title);
+ 1404:   chats[idx] = normalizeChatRecord(auth.session.id, {
+ 1405:     ...existing,
+ 1406:     title: nextTitle,
+ 1407:     chat: { ...mergedChat, title: nextTitle },
+ 1408:     tags: normalizeTags(body.chat.tags ?? existing.tags),
+ 1409:     updated_at: nowUnixSeconds()
+ 1410:   });
+ 1411: 
+ 1412:   await saveChats(auth.session.id, chats);
+ 1413:   return chats[idx];
+ 1414: });
+ 1415: 
+ 1416: app.delete("/api/v1/chats/:id", async (request, reply) => {
+ 1417:   const auth = await requireSession(request, reply);
+ 1418:   if (!auth) return;
+ 1419: 
+ 1420:   const id = (request.params as { id: string }).id;
+ 1421:   const chats = await loadChats(auth.session.id);
+ 1422:   const existing = chats.find((x) => x.id === id);
+ 1423:   if (!existing) {
+ 1424:     return reply.status(404).send({ detail: "Chat not found" });
+ 1425:   }
+ 1426: 
+ 1427:   await saveChats(auth.session.id, chats.filter((x) => x.id !== id));
+ 1428:   await redis.del(chatTasksKey(id));
+ 1429:   return { success: true, id };
+ 1430: });
+ 1431: 
+ 1432: app.delete("/api/v1/chats/", async (request, reply) => {
+ 1433:   const auth = await requireSession(request, reply);
+ 1434:   if (!auth) return;
+ 1435:   await saveChats(auth.session.id, []);
+ 1436:   return { success: true };
+ 1437: });
+ 1438: 
+ 1439: app.post("/api/v1/folders/", async (request, reply) => {
+ 1440:   const auth = await requireSession(request, reply);
+ 1441:   if (!auth) return;
+ 1442: 
+ 1443:   const body = request.body as { name?: string; data?: unknown; meta?: unknown };
+ 1444:   const now = nowUnixSeconds();
+ 1445:   const folder = normalizeFolderRecord(auth.session.id, {
+ 1446:     id: randomUUID(),
+ 1447:     name: textOr(body.name, "Folder"),
+ 1448:     data: isRecord(body.data) ? body.data : {},
+ 1449:     meta: isRecord(body.meta) ? body.meta : {},
+ 1450:     parent_id: null,
+ 1451:     is_expanded: true,
+ 1452:     created_at: now,
+ 1453:     updated_at: now
+ 1454:   });
+ 1455: 
+ 1456:   const folders = await loadFolders(auth.session.id);
+ 1457:   await saveFolders(auth.session.id, [folder, ...folders]);
+ 1458:   return folder;
+ 1459: });
+ 1460: 
+ 1461: app.get("/api/v1/folders/", async (request, reply) => {
+ 1462:   const auth = await requireSession(request, reply);
+ 1463:   if (!auth) return;
+ 1464:   return await loadFolders(auth.session.id);
+ 1465: });
+ 1466: 
+ 1467: app.get("/api/v1/folders/:id", async (request, reply) => {
+ 1468:   const auth = await requireSession(request, reply);
+ 1469:   if (!auth) return;
+ 1470:   const id = (request.params as { id: string }).id;
+ 1471:   const folder = (await loadFolders(auth.session.id)).find((x) => x.id === id);
+ 1472:   if (!folder) {
+ 1473:     return reply.status(404).send({ detail: "Folder not found" });
+ 1474:   }
+ 1475:   return folder;
+ 1476: });
+ 1477: 
+ 1478: app.post("/api/v1/folders/:id/update", async (request, reply) => {
+ 1479:   const auth = await requireSession(request, reply);
+ 1480:   if (!auth) return;
+ 1481: 
+ 1482:   const id = (request.params as { id: string }).id;
+ 1483:   const body = request.body as { name?: string; data?: unknown; meta?: unknown };
+ 1484:   const folders = await loadFolders(auth.session.id);
+ 1485:   const idx = folders.findIndex((x) => x.id === id);
+ 1486:   if (idx === -1) {
+ 1487:     return reply.status(404).send({ detail: "Folder not found" });
+ 1488:   }
+ 1489: 
+ 1490:   folders[idx] = normalizeFolderRecord(auth.session.id, {
+ 1491:     ...folders[idx],
+ 1492:     name: textOr(body.name, folders[idx].name),
+ 1493:     data: isRecord(body.data) ? body.data : folders[idx].data,
+ 1494:     meta: isRecord(body.meta) ? body.meta : folders[idx].meta,
+ 1495:     updated_at: nowUnixSeconds()
+ 1496:   });
+ 1497:   await saveFolders(auth.session.id, folders);
+ 1498:   return folders[idx];
+ 1499: });
+ 1500: 
+ 1501: app.post("/api/v1/folders/:id/update/expanded", async (request, reply) => {
+ 1502:   const auth = await requireSession(request, reply);
+ 1503:   if (!auth) return;
+ 1504:   const id = (request.params as { id: string }).id;
+ 1505:   const body = request.body as { is_expanded?: boolean };
+ 1506:   const folders = await loadFolders(auth.session.id);
+ 1507:   const idx = folders.findIndex((x) => x.id === id);
+ 1508:   if (idx === -1) {
+ 1509:     return reply.status(404).send({ detail: "Folder not found" });
+ 1510:   }
+ 1511:   folders[idx] = { ...folders[idx], is_expanded: Boolean(body.is_expanded), updated_at: nowUnixSeconds() };
+ 1512:   await saveFolders(auth.session.id, folders);
+ 1513:   return folders[idx];
+ 1514: });
+ 1515: 
+ 1516: app.post("/api/v1/folders/:id/update/parent", async (request, reply) => {
+ 1517:   const auth = await requireSession(request, reply);
+ 1518:   if (!auth) return;
+ 1519:   const id = (request.params as { id: string }).id;
+ 1520:   const body = request.body as { parent_id?: string };
+ 1521:   const folders = await loadFolders(auth.session.id);
+ 1522:   const idx = folders.findIndex((x) => x.id === id);
+ 1523:   if (idx === -1) {
+ 1524:     return reply.status(404).send({ detail: "Folder not found" });
+ 1525:   }
+ 1526:   folders[idx] = {
+ 1527:     ...folders[idx],
+ 1528:     parent_id: typeof body.parent_id === "string" ? body.parent_id : null,
+ 1529:     updated_at: nowUnixSeconds()
+ 1530:   };
+ 1531:   await saveFolders(auth.session.id, folders);
+ 1532:   return folders[idx];
+ 1533: });
+ 1534: 
+ 1535: app.post("/api/v1/folders/:id/update/items", async (request, reply) => {
+ 1536:   const auth = await requireSession(request, reply);
+ 1537:   if (!auth) return;
+ 1538:   const id = (request.params as { id: string }).id;
+ 1539:   const body = request.body as { items?: unknown };
+ 1540:   const folders = await loadFolders(auth.session.id);
+ 1541:   const idx = folders.findIndex((x) => x.id === id);
+ 1542:   if (idx === -1) {
+ 1543:     return reply.status(404).send({ detail: "Folder not found" });
+ 1544:   }
+ 1545: 
+ 1546:   const items = isRecord(body.items) ? body.items : {};
+ 1547:   folders[idx] = normalizeFolderRecord(auth.session.id, {
+ 1548:     ...folders[idx],
+ 1549:     items: {
+ 1550:       chat_ids: Array.isArray(items.chat_ids) ? items.chat_ids.filter((x): x is string => typeof x === "string") : [],
+ 1551:       file_ids: Array.isArray(items.file_ids) ? items.file_ids.filter((x): x is string => typeof x === "string") : []
+ 1552:     },
+ 1553:     updated_at: nowUnixSeconds()
+ 1554:   });
+ 1555: 
+ 1556:   await saveFolders(auth.session.id, folders);
+ 1557:   return folders[idx];
+ 1558: });
+ 1559: 
+ 1560: app.delete("/api/v1/folders/:id", async (request, reply) => {
+ 1561:   const auth = await requireSession(request, reply);
+ 1562:   if (!auth) return;
+ 1563: 
+ 1564:   const id = (request.params as { id: string }).id;
+ 1565:   const query = request.query as { delete_contents?: string };
+ 1566:   const deleteContents = query.delete_contents === "true";
+ 1567: 
+ 1568:   const folders = await loadFolders(auth.session.id);
+ 1569:   const exists = folders.some((x) => x.id === id);
+ 1570:   if (!exists) {
+ 1571:     return reply.status(404).send({ detail: "Folder not found" });
+ 1572:   }
+ 1573: 
+ 1574:   const remainingFolders = folders.filter((x) => x.id !== id && x.parent_id !== id);
+ 1575:   await saveFolders(auth.session.id, remainingFolders);
+ 1576: 
+ 1577:   if (!deleteContents) {
+ 1578:     const chats = await loadChats(auth.session.id);
+ 1579:     const moved = chats.map((chat) => (chat.folder_id === id ? { ...chat, folder_id: null, updated_at: nowUnixSeconds() } : chat));
+ 1580:     await saveChats(auth.session.id, moved);
+ 1581:   } else {
+ 1582:     const chats = await loadChats(auth.session.id);
+ 1583:     const kept = chats.filter((chat) => chat.folder_id !== id);
+ 1584:     await saveChats(auth.session.id, kept);
+ 1585:   }
+ 1586: 
+ 1587:   return { success: true, id };
+ 1588: });
+ 1589: 
+ 1590: app.post("/api/v1/tasks/active/chats", async (request, reply) => {
+ 1591:   const auth = await requireSession(request, reply);
+ 1592:   if (!auth) return;
+ 1593: 
+ 1594:   const body = request.body as { chat_ids?: string[] };
+ 1595:   const chatIds = Array.isArray(body.chat_ids) ? body.chat_ids : [];
+ 1596:   const active: string[] = [];
+ 1597: 
+ 1598:   for (const chatId of chatIds) {
+ 1599:     const taskIds = await loadJson<string[]>(chatTasksKey(chatId), []);
+ 1600:     if (taskIds.length > 0) {
+ 1601:       active.push(chatId);
+ 1602:     }
+ 1603:   }
+ 1604: 
+ 1605:   return { active_chat_ids: active };
+ 1606: });
+ 1607: 
+ 1608: app.get("/api/tasks/chat/:chatId", async (request, reply) => {
+ 1609:   const auth = await requireSession(request, reply);
+ 1610:   if (!auth) return;
+ 1611:   const chatId = (request.params as { chatId: string }).chatId;
+ 1612:   return { task_ids: await loadJson<string[]>(chatTasksKey(chatId), []) };
+ 1613: });
+ 1614: 
+ 1615: app.post("/api/tasks/stop/:taskId", async (request, reply) => {
+ 1616:   const auth = await requireSession(request, reply);
+ 1617:   if (!auth) return;
+ 1618:   const taskId = (request.params as { taskId: string }).taskId;
+ 1619:   await setTaskStatus(redis, taskId, "cancelled", 0, 0);
+ 1620:   return { ok: true, task_id: taskId };
+ 1621: });
+ 1622: 
+ 1623: app.post("/api/chat/completed", async (request, reply) => {
+ 1624:   const auth = await requireSession(request, reply);
+ 1625:   if (!auth) return;
+ 1626:   const body = request.body as { messages?: unknown[]; chat_id?: string; id?: string };
+ 1627:   const messages = Array.isArray(body.messages) ? body.messages : [];
+ 1628:   if (body.chat_id && body.id) {
+ 1629:     const tasks = await loadJson<string[]>(chatTasksKey(body.chat_id), []);
+ 1630:     await saveJson(chatTasksKey(body.chat_id), tasks.filter((taskId) => taskId !== body.id));
+ 1631:   }
+ 1632:   return { messages };
+ 1633: });
+ 1634: 
+ 1635: app.post("/api/chat/actions/:actionId", async (request, reply) => {
+ 1636:   const auth = await requireSession(request, reply);
+ 1637:   if (!auth) return;
+ 1638:   const body = request.body as { messages?: unknown[] };
+ 1639:   return { action_id: (request.params as { actionId: string }).actionId, messages: Array.isArray(body.messages) ? body.messages : [] };
+ 1640: });
+ 1641: 
+ 1642: function stringifyMessagesForTask(messages: unknown): string {
+ 1643:   if (!Array.isArray(messages)) {
+ 1644:     return "";
+ 1645:   }
+ 1646: 
+ 1647:   return messages
+ 1648:     .map((message) => {
+ 1649:       if (!isRecord(message)) {
+ 1650:         return "";
+ 1651:       }
+ 1652:       const role = typeof message.role === "string" ? message.role : "user";
+ 1653:       const content = typeof message.content === "string" ? message.content : "";
+ 1654:       return `${role.toUpperCase()}: ${content}`;
+ 1655:     })
+ 1656:     .filter(Boolean)
+ 1657:     .join("\n");
+ 1658: }
+ 1659: 
+ 1660: const DEFAULT_TASK_CONFIG = {
+ 1661:   TASK_MODEL: "",
+ 1662:   TASK_MODEL_EXTERNAL: "",
+ 1663:   ENABLE_TITLE_GENERATION: true,
+ 1664:   TITLE_GENERATION_PROMPT_TEMPLATE: "",
+ 1665:   ENABLE_FOLLOW_UP_GENERATION: true,
+ 1666:   FOLLOW_UP_GENERATION_PROMPT_TEMPLATE: "",
+ 1667:   IMAGE_PROMPT_GENERATION_PROMPT_TEMPLATE: "",
+ 1668:   ENABLE_AUTOCOMPLETE_GENERATION: true,
+ 1669:   AUTOCOMPLETE_GENERATION_INPUT_MAX_LENGTH: -1,
+ 1670:   TAGS_GENERATION_PROMPT_TEMPLATE: "",
+ 1671:   ENABLE_TAGS_GENERATION: true,
+ 1672:   ENABLE_SEARCH_QUERY_GENERATION: true,
+ 1673:   ENABLE_RETRIEVAL_QUERY_GENERATION: true,
+ 1674:   QUERY_GENERATION_PROMPT_TEMPLATE: "",
+ 1675:   TOOLS_FUNCTION_CALLING_PROMPT_TEMPLATE: "",
+ 1676:   VOICE_MODE_PROMPT_TEMPLATE: ""
+ 1677: };
+ 1678: 
+ 1679: app.get("/api/v1/tasks/config", async (request, reply) => {
+ 1680:   const auth = await requireSession(request, reply);
+ 1681:   if (!auth) return;
+ 1682:   return await loadJson("superhuman:tasks:config", DEFAULT_TASK_CONFIG);
+ 1683: });
+ 1684: 
+ 1685: app.post("/api/v1/tasks/config/update", async (request, reply) => {
+ 1686:   const auth = await requireSession(request, reply);
+ 1687:   if (!auth) return;
+ 1688:   const body = isRecord(request.body) ? request.body : {};
+ 1689:   const current = await loadJson("superhuman:tasks:config", DEFAULT_TASK_CONFIG);
+ 1690:   const next = { ...current, ...body };
+ 1691:   await saveJson("superhuman:tasks:config", next);
+ 1692:   return next;
+ 1693: });
+ 1694: 
+ 1695: app.post("/api/v1/tasks/title/completions", async (request, reply) => {
+ 1696:   const auth = await requireSession(request, reply);
+ 1697:   if (!auth) return;
+ 1698: 
+ 1699:   const body = request.body as { model?: string; messages?: unknown[] };
+ 1700:   const model = textOr(body.model, "gpt-5.3-codex");
+ 1701:   const transcript = stringifyMessagesForTask(body.messages);
+ 1702: 
+ 1703:   try {
+ 1704:     return await generateModelResponse(env, {
+ 1705:       model,
+ 1706:       messages: [
+ 1707:         {
+ 1708:           role: "system",
+ 1709:           content:
+ 1710:             "Generate a short chat title in JSON only: {\"title\":\"...\"}. Keep it concise and specific."
+ 1711:         },
+ 1712:         {
+ 1713:           role: "user",
+ 1714:           content: transcript
+ 1715:         }
+ 1716:       ]
+ 1717:     });
+ 1718:   } catch (error) {
+ 1719:     return reply.status(500).send({ detail: error instanceof Error ? error.message : "title generation failed" });
+ 1720:   }
+ 1721: });
+ 1722: 
+ 1723: app.post("/api/v1/tasks/follow_ups/completions", async (request, reply) => {
+ 1724:   const auth = await requireSession(request, reply);
+ 1725:   if (!auth) return;
+ 1726: 
+ 1727:   const body = request.body as { model?: string; messages?: unknown[] };
+ 1728:   const model = textOr(body.model, "gpt-5.3-codex");
+ 1729:   const transcript = stringifyMessagesForTask(body.messages);
+ 1730: 
+ 1731:   try {
+ 1732:     return await generateModelResponse(env, {
+ 1733:       model,
+ 1734:       messages: [
+ 1735:         {
+ 1736:           role: "system",
+ 1737:           content:
+ 1738:             "Return JSON only: {\"follow_ups\":[\"question 1\",\"question 2\",\"question 3\"]}. Generate useful next questions."
+ 1739:         },
+ 1740:         {
+ 1741:           role: "user",
+ 1742:           content: transcript
+ 1743:         }
+ 1744:       ]
+ 1745:     });
+ 1746:   } catch (error) {
+ 1747:     return reply.status(500).send({ detail: error instanceof Error ? error.message : "follow-up generation failed" });
+ 1748:   }
+ 1749: });
+ 1750: 
+ 1751: async function runTaskCompletion(
+ 1752:   reply: { status: (code: number) => { send: (body: unknown) => unknown } },
+ 1753:   body: { model?: string; prompt?: string; messages?: unknown[]; responses?: unknown[] },
+ 1754:   systemPrompt: string
+ 1755: ) {
+ 1756:   const model = textOr(body.model, "gpt-5.3-codex");
+ 1757:   const prompt = textOr(body.prompt, stringifyMessagesForTask(body.messages));
+ 1758:   const responses = Array.isArray(body.responses) ? body.responses.filter((x): x is string => typeof x === "string") : [];
+ 1759: 
+ 1760:   try {
+ 1761:     return await generateModelResponse(env, {
+ 1762:       model,
+ 1763:       messages: [
+ 1764:         { role: "system", content: systemPrompt },
+ 1765:         {
+ 1766:           role: "user",
+ 1767:           content: [prompt, responses.length > 0 ? `Responses:\n${responses.join("\n\n")}` : ""].filter(Boolean).join("\n\n")
+ 1768:         }
+ 1769:       ]
+ 1770:     });
+ 1771:   } catch (error) {
+ 1772:     return reply.status(500).send({ detail: error instanceof Error ? error.message : "task completion failed" });
+ 1773:   }
+ 1774: }
+ 1775: 
+ 1776: app.post("/api/v1/tasks/tags/completions", async (request, reply) => {
+ 1777:   const auth = await requireSession(request, reply);
+ 1778:   if (!auth) return;
+ 1779:   const body = request.body as { model?: string; messages?: unknown[]; prompt?: string };
+ 1780:   return await runTaskCompletion(reply, body, "Return JSON only: {\"tags\":[\"tag1\",\"tag2\",\"tag3\"]}.");
+ 1781: });
+ 1782: 
+ 1783: app.post("/api/v1/tasks/emoji/completions", async (request, reply) => {
+ 1784:   const auth = await requireSession(request, reply);
+ 1785:   if (!auth) return;
+ 1786:   const body = request.body as { model?: string; messages?: unknown[]; prompt?: string };
+ 1787:   return await runTaskCompletion(reply, body, "Return JSON only: {\"emoji\":\"😀\"}. Pick one emoji.");
+ 1788: });
+ 1789: 
+ 1790: app.post("/api/v1/tasks/queries/completions", async (request, reply) => {
+ 1791:   const auth = await requireSession(request, reply);
+ 1792:   if (!auth) return;
+ 1793:   const body = request.body as { model?: string; messages?: unknown[]; prompt?: string };
+ 1794:   return await runTaskCompletion(
+ 1795:     reply,
+ 1796:     body,
+ 1797:     "Return JSON only: {\"queries\":[\"search query 1\",\"search query 2\"]} for retrieval/web search."
+ 1798:   );
+ 1799: });
+ 1800: 
+ 1801: app.post("/api/v1/tasks/auto/completions", async (request, reply) => {
+ 1802:   const auth = await requireSession(request, reply);
+ 1803:   if (!auth) return;
+ 1804:   const body = request.body as { model?: string; messages?: unknown[]; prompt?: string };
+ 1805:   return await runTaskCompletion(reply, body, "Return a concise assistant response.");
+ 1806: });
+ 1807: 
+ 1808: app.post("/api/v1/tasks/moa/completions", async (request, reply) => {
+ 1809:   const auth = await requireSession(request, reply);
+ 1810:   if (!auth) return;
+ 1811:   const body = request.body as { model?: string; prompt?: string; responses?: unknown[] };
+ 1812:   return await runTaskCompletion(reply, body, "Synthesize the best final answer from candidate responses.");
+ 1813: });
+ 1814: 
+ 1815: async function handleCompletion(
+ 1816:   request: OpenAIStyleChatCompletionRequest & { features?: { web_search?: boolean } },
+ 1817:   reply: { header: (k: string, v: string) => void; send: (body: unknown) => unknown; raw: { write: (chunk: string) => void; end: () => void } }
+ 1818: ) {
+ 1819:   const userText = latestUserText(request.messages);
+ 1820:   const webSearchRequested = request.features?.web_search === true;
+ 1821: 
+ 1822:   const enrichedMessages = [...request.messages];
+ 1823: 
+ 1824:   if (webSearchRequested) {
+ 1825:     const searchContext = await tavilySearchContext(userText);
+ 1826:     if (searchContext) {
+ 1827:       enrichedMessages.unshift({
+ 1828:         role: "system",
+ 1829:         content: `${searchContext}\n\nUse these sources when useful and cite URLs in the answer.`
+ 1830:       });
+ 1831:     }
+ 1832:   }
+ 1833: 
+ 1834:   const fetchedContext = await urlFetchContext(userText);
+ 1835:   if (fetchedContext) {
+ 1836:     enrichedMessages.unshift({
+ 1837:       role: "system",
+ 1838:       content: `${fetchedContext}\n\nUse fetched webpage snippets for factual grounding.`
+ 1839:     });
+ 1840:   }
+ 1841: 
+ 1842:   const completion = await generateModelResponse(env, {
+ 1843:     ...request,
+ 1844:     messages: enrichedMessages
+ 1845:   });
+ 1846: 
+ 1847:   // Open WebUI's generateOpenAIChatCompletion expects JSON, even when `stream=true`.
+ 1848:   return reply.send(completion);
+ 1849: }
+ 1850: 
+ 1851: app.post("/api/chat/completions", async (request, reply) => {
+ 1852:   const auth = await requireSession(request, reply);
+ 1853:   if (!auth) return;
+ 1854:   const body = request.body as OpenAIStyleChatCompletionRequest;
+ 1855:   try {
+ 1856:     return await handleCompletion(body, reply);
+ 1857:   } catch (error) {
+ 1858:     return reply.status(500).send({ detail: error instanceof Error ? error.message : "completion failed" });
+ 1859:   }
+ 1860: });
+ 1861: 
+ 1862: app.post("/api/v1/chat/completions", async (request, reply) => {
+ 1863:   const auth = await requireSession(request, reply);
+ 1864:   if (!auth) return;
+ 1865:   const body = request.body as OpenAIStyleChatCompletionRequest;
+ 1866:   try {
+ 1867:     return await handleCompletion(body, reply);
+ 1868:   } catch (error) {
+ 1869:     return reply.status(500).send({ detail: error instanceof Error ? error.message : "completion failed" });
+ 1870:   }
+ 1871: });
+ 1872: 
+ 1873: app.post("/api/v1/tasks", async (request) => {
+ 1874:   const body = request.body as { prompt?: string; chatId?: string; userId?: string; maxAttempts?: number };
+ 1875:   const taskId = randomUUID();
+ 1876:   const task = {
+ 1877:     id: taskId,
+ 1878:     userId: body.userId ?? "anonymous",
+ 1879:     chatId: body.chatId ?? "default",
+ 1880:     prompt: body.prompt ?? "",
+ 1881:     state: "queued",
+ 1882:     attempt: 0,
+ 1883:     maxAttempts: Math.max(1, Math.min(10, body.maxAttempts ?? 3)),
+ 1884:     createdAt: Date.now(),
+ 1885:     updatedAt: Date.now()
+ 1886:   } as const;
+ 1887: 
+ 1888:   await enqueueTask(redis, task);
+ 1889:   return { ok: true, taskId };
+ 1890: });
+ 1891: 
+ 1892: app.get("/api/v1/tasks/:taskId", async (request) => {
+ 1893:   const taskId = (request.params as { taskId: string }).taskId;
+ 1894:   const status = await getTaskStatus(redis, taskId);
+ 1895:   return { taskId, status };
+ 1896: });
+ 1897: 
+ 1898: app.post("/api/v1/tasks/:taskId/stop", async (request) => {
+ 1899:   const taskId = (request.params as { taskId: string }).taskId;
+ 1900:   await setTaskStatus(redis, taskId, "cancelled", 0, 0);
+ 1901:   return { ok: true, taskId, state: "cancelled" };
+ 1902: });
+ 1903: 
+ 1904: app.post("/api/oauth/start/:provider", async (request, reply) => {
+ 1905:   const providerRaw = (request.params as { provider: string }).provider;
+ 1906:   if (!isOAuthProvider(providerRaw)) {
+ 1907:     return reply.status(400).send({ detail: "unsupported provider" });
+ 1908:   }
+ 1909: 
+ 1910:   const cfg = oauthProviderConfig(providerRaw);
+ 1911:   if (!cfg) {
+ 1912:     return reply.status(400).send({ detail: `OAuth client not configured for provider: ${providerRaw}` });
+ 1913:   }
+ 1914: 
+ 1915:   const state = randomUUID();
+ 1916:   const { verifier, challenge } = createPkcePair();
+ 1917:   await redis.set(
+ 1918:     oauthPendingKey(providerRaw, state),
+ 1919:     JSON.stringify({ verifier, createdAt: Date.now() }),
+ 1920:     "EX",
+ 1921:     600
+ 1922:   );
+ 1923:   await redis.set(oauthStatusKey(providerRaw, state), "pending", "EX", 900);
+ 1924: 
+ 1925:   const params = new URLSearchParams({
+ 1926:     response_type: "code",
+ 1927:     client_id: cfg.clientId,
+ 1928:     redirect_uri: oauthRedirectUri(providerRaw),
+ 1929:     scope: cfg.scopes.join(" "),
+ 1930:     state,
+ 1931:     code_challenge: challenge,
+ 1932:     code_challenge_method: "S256"
+ 1933:   });
+ 1934: 
+ 1935:   return {
+ 1936:     ok: true,
+ 1937:     provider: providerRaw,
+ 1938:     state,
+ 1939:     redirect_uri: oauthRedirectUri(providerRaw),
+ 1940:     expires_in_seconds: 600,
+ 1941:     authorization_url: `${cfg.authorizationUrl}?${params.toString()}`
+ 1942:   };
+ 1943: });
+ 1944: 
+ 1945: app.get("/api/oauth/status/:provider", async (request, reply) => {
+ 1946:   const providerRaw = (request.params as { provider: string }).provider;
+ 1947:   if (!isOAuthProvider(providerRaw)) {
+ 1948:     return reply.status(400).send({ detail: "unsupported provider" });
+ 1949:   }
+ 1950: 
+ 1951:   const state = String((request.query as { state?: string }).state ?? "");
+ 1952:   if (!state) {
+ 1953:     const client = convexAdminClient();
+ 1954:     if (!client) {
+ 1955:       return { ok: false, provider: providerRaw, status: "missing_convex_admin" };
+ 1956:     }
+ 1957: 
+ 1958:     let status: { authorized?: boolean; updatedAt?: number | null; expiresAt?: number | null };
+ 1959:     try {
+ 1960:       status = (await (client as unknown as { query: (name: string, args: unknown) => Promise<unknown> }).query(
+ 1961:         "oauth:providerStatus",
+ 1962:         { provider: providerRaw, subject: "system" }
+ 1963:       )) as { authorized?: boolean; updatedAt?: number | null; expiresAt?: number | null };
+ 1964:     } catch (error) {
+ 1965:       logger.error({ error, provider: providerRaw }, "oauth provider status query failed");
+ 1966:       return { ok: false, provider: providerRaw, status: "status_query_failed" };
+ 1967:     }
+ 1968: 
+ 1969:     return {
+ 1970:       ok: status.authorized === true,
+ 1971:       provider: providerRaw,
+ 1972:       status: status.authorized === true ? "authorized" : "not_authorized",
+ 1973:       authorized: status.authorized === true,
+ 1974:       updatedAt: status.updatedAt ?? null,
+ 1975:       expiresAt: status.expiresAt ?? null
+ 1976:     };
+ 1977:   }
+ 1978: 
+ 1979:   const statusValue = await redis.get(oauthStatusKey(providerRaw, state));
+ 1980:   if (!statusValue) {
+ 1981:     return { ok: false, provider: providerRaw, state, status: "pending" };
+ 1982:   }
+ 1983:   return {
+ 1984:     ok: statusValue === "authorized",
+ 1985:     provider: providerRaw,
+ 1986:     state,
+ 1987:     status: statusValue,
+ 1988:     authorized: statusValue === "authorized"
+ 1989:   };
+ 1990: });
+ 1991: 
+ 1992: app.get("/api/oauth/providers/status", async (_, reply) => {
+ 1993:   const client = convexAdminClient();
+ 1994:   if (!client) {
+ 1995:     return reply.status(400).send({ detail: "Convex admin client is not configured" });
+ 1996:   }
+ 1997: 
+ 1998:   let rows: Array<Record<string, unknown>>;
+ 1999:   try {
+ 2000:     rows = (await (client as unknown as { query: (name: string, args: unknown) => Promise<unknown> }).query(
+ 2001:       "oauth:listProviderStatus",
+ 2002:       { subject: "system" }
+ 2003:     )) as Array<Record<string, unknown>>;
+ 2004:   } catch (error) {
+ 2005:     logger.error({ error }, "oauth providers status query failed");
+ 2006:     return reply.status(500).send({ detail: "oauth status query failed" });
+ 2007:   }
+ 2008: 
+ 2009:   return { ok: true, providers: rows };
+ 2010: });
+ 2011: 
+ 2012: app.post("/api/oauth/manual/:provider", async (request, reply) => {
+ 2013:   const providerRaw = (request.params as { provider: string }).provider;
+ 2014:   if (!isOAuthProvider(providerRaw)) {
+ 2015:     return reply.status(400).send({ detail: "unsupported provider" });
+ 2016:   }
+ 2017: 
+ 2018:   const body = request.body as { state?: string; code?: string };
+ 2019:   const state = String(body.state ?? "");
+ 2020:   const code = String(body.code ?? "");
+ 2021:   if (!state || !code) {
+ 2022:     return reply.status(400).send({ detail: "state and code are required" });
+ 2023:   }
+ 2024: 
+ 2025:   try {
+ 2026:     await exchangeOAuthCode(providerRaw, state, code);
+ 2027:     await redis.set(oauthStatusKey(providerRaw, state), "authorized", "EX", 900);
+ 2028:     return { ok: true, provider: providerRaw, state, status: "authorized" };
+ 2029:   } catch (error) {
+ 2030:     await redis.set(oauthStatusKey(providerRaw, state), "error:exchange_failed", "EX", 900);
+ 2031:     logger.error({ error, provider: providerRaw }, "manual oauth exchange failed");
+ 2032:     return reply.status(400).send({ detail: "OAuth exchange failed" });
+ 2033:   }
+ 2034: });
+ 2035: 
+ 2036: app.get("/oauth/callback/:provider", async (request, reply) => {
+ 2037:   const providerRaw = (request.params as { provider: string }).provider;
+ 2038:   if (!isOAuthProvider(providerRaw)) {
+ 2039:     return reply.status(400).type("text/html").send("<h1>OAuth failed</h1><p>Unsupported provider.</p>");
+ 2040:   }
+ 2041: 
+ 2042:   const query = request.query as { code?: string; state?: string; error?: string };
+ 2043:   const state = query.state ?? "";
+ 2044:   if (!state) {
+ 2045:     return reply.type("text/html").send("<h1>OAuth failed</h1><p>Missing state.</p>");
+ 2046:   }
+ 2047: 
+ 2048:   if (query.error) {
+ 2049:     await redis.set(oauthStatusKey(providerRaw, state), `error:${query.error}`, "EX", 900);
+ 2050:     return reply.type("text/html").send(`<h1>OAuth failed</h1><p>${query.error}</p>`);
+ 2051:   }
+ 2052: 
+ 2053:   if (!query.code) {
+ 2054:     await redis.set(oauthStatusKey(providerRaw, state), "error:missing_code", "EX", 900);
+ 2055:     return reply.type("text/html").send("<h1>OAuth failed</h1><p>Missing code.</p>");
+ 2056:   }
+ 2057: 
+ 2058:   try {
+ 2059:     await exchangeOAuthCode(providerRaw, state, query.code);
+ 2060:     await redis.set(oauthStatusKey(providerRaw, state), "authorized", "EX", 900);
+ 2061:     return reply
+ 2062:       .type("text/html")
+ 2063:       .send("<h1>OAuth completed</h1><p>Authorization successful. You can return to the CLI now.</p>");
+ 2064:   } catch (error) {
+ 2065:     await redis.set(oauthStatusKey(providerRaw, state), "error:exchange_failed", "EX", 900);
+ 2066:     logger.error({ error, provider: providerRaw }, "oauth callback exchange failed");
+ 2067:     return reply.type("text/html").send("<h1>OAuth failed</h1><p>Token exchange failed.</p>");
+ 2068:   }
+ 2069: });
+ 2070: 
+ 2071: app.post("/api/settings/providers/test", async (request) => {
+ 2072:   const body = request.body as Record<string, string | undefined>;
+ 2073:   const checks = Object.entries(body).map(([key, value]) => ({
+ 2074:     key,
+ 2075:     ok: Boolean(value && String(value).trim().length > 0)
+ 2076:   }));
+ 2077: 
+ 2078:   return {
+ 2079:     ok: checks.every((x) => x.ok),
+ 2080:     checks
+ 2081:   };
+ 2082: });
+ 2083: 
+ 2084: app.get("/api/access/status", async (request) => {
+ 2085:   const token = bearerToken(request.headers.authorization);
+ 2086:   if (!token || !env.CONVEX_URL) {
+ 2087:     return { authenticated: false, allowlisted: false, activeProfile: false };
+ 2088:   }
+ 2089: 
+ 2090:   const authedClient = new ConvexHttpClient(env.CONVEX_URL, { auth: token });
+ 2091:   const status = (await (authedClient as unknown as { query: (name: string, args: unknown) => Promise<unknown> }).query(
+ 2092:     "users:accessStatus",
+ 2093:     {}
+ 2094:   )) as { authenticated: boolean; allowlisted: boolean; activeProfile: boolean };
+ 2095: 
+ 2096:   if (status.authenticated && status.allowlisted && !status.activeProfile) {
+ 2097:     await (authedClient as unknown as { mutation: (name: string, args: unknown) => Promise<unknown> }).mutation(
+ 2098:       "users:activateIfAllowlisted",
+ 2099:       {}
+ 2100:     );
+ 2101:     return { ...status, activeProfile: true };
+ 2102:   }
+ 2103: 
+ 2104:   return status;
+ 2105: });
+ 2106: 
+ 2107: app.get("/access-not-granted", async (_, reply) => {
+ 2108:   return reply.type("text/html").send(`<!doctype html><html><body style="font-family:sans-serif;padding:2rem">
+ 2109:   <h1>Access not granted</h1>
+ 2110:   <p>Your account is authenticated, but your email is not allowlisted for this private instance.</p>
+ 2111:   </body></html>`);
+ 2112: });
+ 2113: 
+ 2114: app.get("/", async (_, reply) => {
+ 2115:   return reply.type("text/html").send(`<!doctype html><html><body style="font-family:sans-serif;padding:2rem">
+ 2116:   <h1>Superhuman</h1>
+ 2117:   <p>Frontend baseline: Open WebUI source is vendored at <code>vendor/open-webui</code>.</p>
+ 2118:   <p>Use <code>superhuman doctor</code> to validate runtime dependencies.</p>
+ 2119:   </body></html>`);
+ 2120: });
+ 2121: 
+ 2122: const port = Number(process.env.PORT ?? 3000);
+ 2123: 
+ 2124: app.listen({ port, host: "0.0.0.0" }).then(() => {
+ 2125:   logger.info({ port }, "web server started");
+ 2126: });

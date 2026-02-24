@@ -1,0 +1,66 @@
+services:
+  redis:
+    image: redis:7
+    command: ["redis-server", "--maxmemory", "256mb", "--maxmemory-policy", "allkeys-lru"]
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  web:
+    image: node:22
+    working_dir: /app
+    volumes:
+      - ../../:/app
+    command: sh -lc "corepack enable && corepack prepare pnpm@10.5.2 --activate && pnpm install --frozen-lockfile && pnpm --filter @superhuman/web build && pnpm --filter @superhuman/web start"
+    env_file:
+      - ../../.env
+    environment:
+      - NODE_ENV=production
+    ports:
+      - "3000:3000"
+    restart: unless-stopped
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+
+  worker:
+    image: node:22
+    working_dir: /app
+    volumes:
+      - ../../:/app
+    command: sh -lc "corepack enable && corepack prepare pnpm@10.5.2 --activate && pnpm install --frozen-lockfile && pnpm --filter @superhuman/worker build && pnpm --filter @superhuman/worker start"
+    env_file:
+      - ../../.env
+    environment:
+      - NODE_ENV=production
+    restart: unless-stopped
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  frontend:
+    image: node:22
+    working_dir: /app/vendor/open-webui
+    volumes:
+      - ../../:/app
+    environment:
+      - VITE_SUPERHUMAN_WEBUI_BASE_URL=${APP_URL:-http://127.0.0.1:3000}
+      - NODE_ENV=production
+      - NODE_OPTIONS=--max-old-space-size=4096
+    command: sh -lc "if [ -f package-lock.json ]; then npm ci --no-audit --no-fund --legacy-peer-deps; else npm install --no-audit --no-fund --legacy-peer-deps; fi && npm run build && npm run preview -- --host 0.0.0.0 --port 4173"
+    ports:
+      - "4173:4173"
+    restart: unless-stopped
+    depends_on:
+      web:
+        condition: service_healthy

@@ -1,0 +1,28 @@
+{
+  "name": "@superhuman/cli",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "superhuman": "dist/index.js"
+  },
+  "scripts": {
+    "dev": "tsx src/index.ts",
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "node -e \"console.log('no tests yet')\"",
+    "lint": "node -e \"console.log('no lint config yet')\""
+  },
+  "dependencies": {
+    "@superhuman/core": "workspace:*",
+    "commander": "^14.0.1",
+    "convex": "^1.24.8",
+    "prompts": "^2.4.2",
+    "undici": "^7.16.0"
+  },
+  "devDependencies": {
+    "@types/prompts": "^2.4.9",
+    "tsx": "^4.20.5",
+    "typescript": "^5.9.2"
+  }
+}
