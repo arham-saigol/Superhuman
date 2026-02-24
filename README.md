@@ -4,6 +4,10 @@ VPS-first experimental AI chat stack with Convex Cloud + Redis + worker orchestr
 
 ## Fresh VPS Setup (Ubuntu/Debian)
 
+Node compatibility note:
+- `vendor/open-webui` currently requires Node.js major `18-22`.
+- If your VPS image has Node `24.x`, `superhuman setup` will now automatically install Node `22.x`.
+
 1. Prepare host and clone:
    - `sudo apt-get update && sudo apt-get install -y git curl ca-certificates`
    - `git clone <your-repo-url> superhuman && cd superhuman`

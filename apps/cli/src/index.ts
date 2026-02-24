@@ -16,6 +16,9 @@ interface RunResult {
 }
 
 const PNPM_VERSION = "10.5.2";
+const NODE_MIN_MAJOR = 18;
+const NODE_MAX_MAJOR = 22;
+const NODE_SETUP_MAJOR = 22;
 const WEB_PORT = Number(process.env.PORT ?? 3000);
 const FRONTEND_PORT = Number(process.env.FRONTEND_PORT ?? 4173);
 
@@ -277,14 +280,24 @@ async function installCommand(opts: { mode?: "systemd" | "docker"; repo?: string
       await bashOrThrow("sudo apt-get update");
       await bashOrThrow("sudo apt-get install -y curl ca-certificates git");
 
-      let needsNodeInstall = !(await commandExists("node"));
-      if (!needsNodeInstall) {
+      const hasNode = await commandExists("node");
+      let installedNodeMajor = 0;
+      if (hasNode) {
         const version = await run("node", ["-v"]);
-        const major = Number((version.stdout.trim().match(/^v(\d+)/) ?? [])[1] ?? "0");
-        needsNodeInstall = major < 18;
+        installedNodeMajor = Number((version.stdout.trim().match(/^v(\d+)/) ?? [])[1] ?? "0");
       }
+      const needsNodeInstall =
+        !hasNode ||
+        installedNodeMajor < NODE_MIN_MAJOR ||
+        installedNodeMajor > NODE_MAX_MAJOR;
       if (needsNodeInstall) {
-        await bashOrThrow("curl -fsSL https://deb.nodesource.com/setup_lts.x | sudo -E bash -");
+        const detected = hasNode && installedNodeMajor > 0
+          ? `detected Node.js major ${installedNodeMajor}`
+          : "node not detected";
+        console.log(
+          `[install] ${detected}; installing Node.js ${NODE_SETUP_MAJOR}.x (required range ${NODE_MIN_MAJOR}-${NODE_MAX_MAJOR})`
+        );
+        await bashOrThrow(`curl -fsSL https://deb.nodesource.com/setup_${NODE_SETUP_MAJOR}.x | sudo -E bash -`);
         await bashOrThrow("sudo apt-get install -y nodejs");
       }
 
