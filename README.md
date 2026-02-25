@@ -7,8 +7,8 @@ VPS-first AI chat stack with Open WebUI frontend, Superhuman API/worker, Redis, 
 Recommended: one command bootstrap with automatic install, systemd setup, firewall, Nginx reverse proxy, and TLS.
 
 ```bash
-curl -fsSL <raw-bootstrap-url>/deploy/bootstrap/bootstrap-vps.sh | bash -s -- \
-  --repo <your-repo-url> \
+curl -fsSL https://raw.githubusercontent.com/arham-saigol/Superhuman/main/deploy/bootstrap/bootstrap-vps.sh | bash -s -- \
+  --repo https://github.com/arham-saigol/Superhuman.git \
   --branch main \
   --target /opt/superhuman \
   --service-user superhuman \
@@ -26,7 +26,7 @@ Notes:
 ```bash
 sudo apt-get update && sudo apt-get install -y git curl ca-certificates
 
-git clone <your-repo-url> /opt/superhuman
+git clone https://github.com/arham-saigol/Superhuman.git /opt/superhuman
 cd /opt/superhuman
 
 corepack enable
