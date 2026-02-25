@@ -2354,30 +2354,18 @@ app.post("/api/settings/providers/test", async (request) => {
   };
 });
 
-app.get("/api/access/status", async (request) => {
-  const token = bearerToken(request.headers.authorization);
-  if (!token || !convexConfig.url) {
+app.get("/api/access/status", async (request, reply) => {
+  const auth = await requireSession(request, reply, { allowPending: true });
+  if (!auth) {
     return { authenticated: false, allowlisted: false, activeProfile: false };
   }
 
-  const authedClient = convexHttpClient(token);
-  if (!authedClient) {
-    return { authenticated: false, allowlisted: false, activeProfile: false };
-  }
-  const status = (await (authedClient as unknown as { query: (name: string, args: unknown) => Promise<unknown> }).query(
-    "users:accessStatus",
-    {}
-  )) as { authenticated: boolean; allowlisted: boolean; activeProfile: boolean };
-
-  if (status.authenticated && status.allowlisted && !status.activeProfile) {
-    await (authedClient as unknown as { mutation: (name: string, args: unknown) => Promise<unknown> }).mutation(
-      "users:activateIfAllowlisted",
-      {}
-    );
-    return { ...status, activeProfile: true };
-  }
-
-  return status;
+  const allowlisted = auth.session.accessGranted === "true";
+  return {
+    authenticated: true,
+    allowlisted,
+    activeProfile: allowlisted
+  };
 });
 
 app.get("/access-not-granted", async (_, reply) => {
