@@ -49,6 +49,8 @@ assert.equal(isPlaceholderSecret("real-secret"), false);
 {
   const key = extractAdminKeyFromOutput("Admin key: admin|abc123\n");
   assert.equal(key, "admin|abc123");
+  const keySplitLine = extractAdminKeyFromOutput("Admin key:\nconvex-self-hosted|abc123\n");
+  assert.equal(keySplitLine, "convex-self-hosted|abc123");
   assert.equal(extractAdminKeyFromOutput("no key here"), null);
 }
 

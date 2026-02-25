@@ -7,10 +7,17 @@ export function isPlaceholderSecret(value: string | undefined): boolean {
 
 export function extractAdminKeyFromOutput(output: string): string | null {
   const lines = output.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
-  for (const line of lines) {
+  for (let idx = 0; idx < lines.length; idx += 1) {
+    const line = lines[idx];
     const match = line.match(/^admin key:\s*(.+)$/i);
     if (match?.[1]) {
       return match[1].trim();
+    }
+    if (/^admin key:\s*$/i.test(line)) {
+      const nextLine = lines[idx + 1]?.trim();
+      if (nextLine) {
+        return nextLine;
+      }
     }
   }
   return null;
