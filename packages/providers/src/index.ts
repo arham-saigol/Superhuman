@@ -1,18 +1,136 @@
 import { generateText } from "ai";
 import { createOpenAI } from "@ai-sdk/openai";
-import type { AppEnv, ModelId, ProviderId } from "@superhuman/core";
+import { logger, type AppEnv, type ModelId, type ProviderId } from "@superhuman/core";
 
 export interface ProviderBinding {
   provider: ProviderId;
   model: ModelId;
 }
 
-function upstreamModelId(provider: ProviderId, model: ModelId): string {
-  if (provider === "deepseek" && model === "deepseek-v3.2") {
-    // DeepSeek OpenAI-compatible endpoint expects concrete provider model ids.
-    return "deepseek-chat";
+const PROVIDER_MODEL_CACHE_TTL_MS = 5 * 60 * 1_000;
+const providerModelCache = new Map<string, { expiresAt: number; ids: string[] }>();
+
+const KNOWN_UPSTREAM_MODEL_IDS: Partial<Record<ProviderId, Partial<Record<ModelId, string[]>>>> = {
+  codex: {
+    "gpt-5.3-codex": ["gpt-5.3-codex", "gpt-5.3", "gpt-5"]
+  },
+  qwen: {
+    "qwen-3.5": ["qwen-3.5", "qwen3", "qwen-plus"]
+  },
+  fireworks: {
+    "minimax-m2.5": ["fireworks/minimax-m2p5", "minimax-m2p5", "minimax-m2.5"],
+    "glm-5": ["fireworks/glm-5", "glm-5"],
+    "deepseek-v3.2": ["fireworks/deepseek-v3p2", "deepseek-v3p2", "deepseek-v3.2", "deepseek-v3"]
+  },
+  deepseek: {
+    "deepseek-v3.2": ["deepseek-chat", "deepseek-v3.2", "deepseek-v3"]
+  },
+  ollama: {
+    "minimax-m2.5": ["minimax-m2.5", "minimax-m2p5"],
+    "glm-5": ["glm-5", "glm:5"],
+    "deepseek-v3.2": ["deepseek-v3.2", "deepseek-r1", "deepseek-chat"]
+  },
+  baseten: {
+    "minimax-m2.5": ["minimax-m2.5", "minimax-m2p5"],
+    "glm-5": ["glm-5"],
+    "deepseek-v3.2": ["deepseek-v3.2", "deepseek-v3"]
   }
-  return model;
+};
+
+function envModelOverride(provider: ProviderId, model: ModelId): string | null {
+  const logicalModelSuffix = model.toUpperCase().replace(/[^A-Z0-9]+/g, "_");
+  const providerPrefix = provider.toUpperCase();
+  const key = `MODEL_OVERRIDE_${providerPrefix}_${logicalModelSuffix}`;
+  const value = process.env[key];
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : null;
+}
+
+function knownModelCandidates(provider: ProviderId, model: ModelId): string[] {
+  return KNOWN_UPSTREAM_MODEL_IDS[provider]?.[model] ?? [model];
+}
+
+function normalizeModelId(value: string): string {
+  return value.toLowerCase().replace(/[^a-z0-9]/g, "");
+}
+
+function modelMatchScore(targetModel: ModelId, candidateId: string): number {
+  const raw = candidateId.toLowerCase();
+  const normalized = normalizeModelId(candidateId);
+  const checks: Array<[boolean, number]> = [];
+
+  switch (targetModel) {
+    case "minimax-m2.5":
+      checks.push([raw.includes("minimax"), 8], [/m2([._-]?5|p5)/.test(raw), 5], [normalized.includes("m25"), 3]);
+      break;
+    case "glm-5":
+      checks.push([raw.includes("glm"), 8], [/(^|[^0-9])5([^0-9]|$)/.test(raw), 5], [normalized.includes("glm5"), 3]);
+      break;
+    case "deepseek-v3.2":
+      checks.push([raw.includes("deepseek"), 8], [/(v3([._-]?2|p2)|deepseek-chat)/.test(raw), 5], [normalized.includes("v32"), 3]);
+      break;
+    case "qwen-3.5":
+      checks.push([raw.includes("qwen"), 8], [/(3([._-]?5|p5)|qwenplus)/.test(raw), 5], [normalized.includes("qwen35"), 3]);
+      break;
+    case "gpt-5.3-codex":
+      checks.push([raw.includes("gpt"), 6], [/(5([._-]?3)?)/.test(raw), 4], [raw.includes("codex"), 2]);
+      break;
+    default:
+      break;
+  }
+
+  return checks.reduce((sum, [ok, points]) => sum + (ok ? points : 0), 0);
+}
+
+function rankedDiscoveredCandidates(targetModel: ModelId, discoveredModelIds: string[]): string[] {
+  const ranked = discoveredModelIds
+    .map((id) => ({ id, score: modelMatchScore(targetModel, id) }))
+    .filter((item) => item.score > 0)
+    .sort((a, b) => b.score - a.score)
+    .map((item) => item.id);
+
+  return ranked.slice(0, 5);
+}
+
+function dedupeNonEmpty(values: string[]): string[] {
+  return Array.from(new Set(values.map((value) => value.trim()).filter((value) => value.length > 0)));
+}
+
+async function fetchProviderModelIds(
+  provider: ProviderId,
+  providerConfig: { baseURL: string; apiKey: string }
+): Promise<string[]> {
+  const cacheKey = `${provider}:${providerConfig.baseURL}`;
+  const now = Date.now();
+  const cached = providerModelCache.get(cacheKey);
+  if (cached && cached.expiresAt > now) {
+    return cached.ids;
+  }
+
+  try {
+    const url = `${providerConfig.baseURL.replace(/\/$/, "")}/models`;
+    const response = await fetch(url, {
+      method: "GET",
+      headers: {
+        Authorization: `Bearer ${providerConfig.apiKey}`,
+        Accept: "application/json"
+      }
+    });
+    if (!response.ok) {
+      return [];
+    }
+    const body = (await response.json()) as { data?: Array<{ id?: string }> };
+    const ids = Array.isArray(body.data)
+      ? body.data
+          .map((entry) => (typeof entry?.id === "string" ? entry.id.trim() : ""))
+          .filter((id) => id.length > 0)
+      : [];
+    providerModelCache.set(cacheKey, { expiresAt: now + PROVIDER_MODEL_CACHE_TTL_MS, ids });
+    return ids;
+  } catch {
+    return [];
+  }
 }
 
 export interface OpenAIChatMessage {
@@ -154,18 +272,56 @@ export async function generateModelResponse(
   if (!providerConfig) {
     throw new Error(`Provider not configured: ${binding.provider}`);
   }
-  const providerModel = upstreamModelId(binding.provider, binding.model);
 
   const openai = createOpenAI({
     baseURL: providerConfig.baseURL,
     apiKey: providerConfig.apiKey
   });
 
-  const result = await generateText({
-    model: openai(providerModel),
-    messages: request.messages,
-    temperature: request.temperature
-  });
+  const explicitOverride = envModelOverride(binding.provider, binding.model);
+  const knownCandidates = knownModelCandidates(binding.provider, binding.model);
+  const discoveredModelIds = await fetchProviderModelIds(binding.provider, providerConfig);
+  const discoveredCandidates = rankedDiscoveredCandidates(binding.model, discoveredModelIds);
+  const providerCandidates = dedupeNonEmpty([
+    ...(explicitOverride ? [explicitOverride] : []),
+    ...knownCandidates,
+    ...discoveredCandidates,
+    binding.model
+  ]);
+
+  let result: Awaited<ReturnType<typeof generateText>> | null = null;
+  const failures: string[] = [];
+
+  for (const providerModel of providerCandidates) {
+    try {
+      result = await generateText({
+        model: openai(providerModel),
+        messages: request.messages,
+        temperature: request.temperature
+      });
+      break;
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      failures.push(`${providerModel}: ${detail}`);
+    }
+  }
+
+  if (!result) {
+    logger.error(
+      {
+        provider: binding.provider,
+        logicalModel: binding.model,
+        candidateModels: providerCandidates,
+        failures
+      },
+      "all upstream model candidates failed"
+    );
+
+    const lastError = failures.at(-1) ?? "unknown provider error";
+    throw new Error(
+      `Provider ${binding.provider} failed for model ${binding.model}. Tried ${providerCandidates.join(", ")}. Last error: ${lastError}`
+    );
+  }
 
   const promptTokenGuess = estimateTokens(request.messages.map((m) => m.content).join("\n"));
   const completionTokenGuess = estimateTokens(result.text);
