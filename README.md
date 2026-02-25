@@ -21,6 +21,17 @@ Notes:
 - `--email` is required for TLS (Let's Encrypt), unless you pass `--skip-tls`.
 - For private-only access, use `--ssh-only`.
 
+Private access only (no public ingress/firewall/TLS changes):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/arham-saigol/Superhuman/main/deploy/bootstrap/bootstrap-vps.sh | bash -s -- \
+  --repo https://github.com/arham-saigol/Superhuman.git \
+  --branch main \
+  --target /opt/superhuman \
+  --service-user superhuman \
+  --ssh-only
+```
+
 ## Manual Setup
 
 ```bash
