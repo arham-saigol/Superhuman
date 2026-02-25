@@ -663,6 +663,14 @@ function latestUserText(messages: Array<{ role: string; content: string }>): str
   return "";
 }
 
+function resolveRequestModel(model: unknown): string {
+  if (typeof model === "string" && model.trim().length > 0) {
+    return model.trim();
+  }
+  const fallback = listOpenAIStyleModels(env).find((item) => item.available)?.id;
+  return fallback ?? "gpt-5.3-codex";
+}
+
 function extractUrls(text: string): string[] {
   const matches = text.match(/https?:\/\/[^\s)]+/g) ?? [];
   return [...new Set(matches)].slice(0, 2);
@@ -791,12 +799,13 @@ app.get("/api/health", async () => {
 });
 
 app.get("/api/config", async () => {
+  const defaultModel = resolveRequestModel(undefined);
   return {
     status: true,
     name: "Superhuman",
     version: "0.1.0",
     default_locale: "en-US",
-    default_models: ["gpt-5.3-codex"],
+    default_models: [defaultModel],
     features: {
       enable_signup: true,
       enable_login_form: true,
@@ -1846,7 +1855,7 @@ app.post("/api/v1/tasks/title/completions", async (request, reply) => {
   if (!auth) return;
 
   const body = request.body as { model?: string; messages?: unknown[] };
-  const model = textOr(body.model, "gpt-5.3-codex");
+  const model = resolveRequestModel(body.model);
   const transcript = stringifyMessagesForTask(body.messages);
 
   try {
@@ -1874,7 +1883,7 @@ app.post("/api/v1/tasks/follow_ups/completions", async (request, reply) => {
   if (!auth) return;
 
   const body = request.body as { model?: string; messages?: unknown[] };
-  const model = textOr(body.model, "gpt-5.3-codex");
+  const model = resolveRequestModel(body.model);
   const transcript = stringifyMessagesForTask(body.messages);
 
   try {
@@ -1902,7 +1911,7 @@ async function runTaskCompletion(
   body: { model?: string; prompt?: string; messages?: unknown[]; responses?: unknown[] },
   systemPrompt: string
 ) {
-  const model = textOr(body.model, "gpt-5.3-codex");
+  const model = resolveRequestModel(body.model);
   const prompt = textOr(body.prompt, stringifyMessagesForTask(body.messages));
   const responses = Array.isArray(body.responses) ? body.responses.filter((x): x is string => typeof x === "string") : [];
 
@@ -1990,6 +1999,7 @@ async function handleCompletion(
 
   const completion = await generateModelResponse(env, {
     ...request,
+    model: resolveRequestModel(request.model),
     messages: enrichedMessages
   });
 

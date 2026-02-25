@@ -7,6 +7,14 @@ export interface ProviderBinding {
   model: ModelId;
 }
 
+function upstreamModelId(provider: ProviderId, model: ModelId): string {
+  if (provider === "deepseek" && model === "deepseek-v3.2") {
+    // DeepSeek OpenAI-compatible endpoint expects concrete provider model ids.
+    return "deepseek-chat";
+  }
+  return model;
+}
+
 export interface OpenAIChatMessage {
   role: "system" | "user" | "assistant";
   content: string;
@@ -146,6 +154,7 @@ export async function generateModelResponse(
   if (!providerConfig) {
     throw new Error(`Provider not configured: ${binding.provider}`);
   }
+  const providerModel = upstreamModelId(binding.provider, binding.model);
 
   const openai = createOpenAI({
     baseURL: providerConfig.baseURL,
@@ -153,7 +162,7 @@ export async function generateModelResponse(
   });
 
   const result = await generateText({
-    model: openai(binding.model),
+    model: openai(providerModel),
     messages: request.messages,
     temperature: request.temperature
   });
