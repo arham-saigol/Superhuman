@@ -124,6 +124,24 @@ async function commandExists(cmd: string): Promise<boolean> {
   }
 }
 
+async function hasDockerComposePlugin(): Promise<boolean> {
+  if (!(await commandExists("docker"))) {
+    return false;
+  }
+  const result = await run("docker", ["compose", "version"]);
+  return result.code === 0;
+}
+
+async function runDockerComposeOrThrow(args: string[], cwd?: string): Promise<RunResult> {
+  if (await hasDockerComposePlugin()) {
+    return runOrThrow("docker", ["compose", ...args], cwd);
+  }
+  if (await commandExists("docker-compose")) {
+    return runOrThrow("docker-compose", args, cwd);
+  }
+  throw new Error("Docker Compose is required but not available. Install docker-compose-plugin or docker-compose.");
+}
+
 function parseDotEnv(content: string): Record<string, string> {
   const lines = content.split(/\r?\n/);
   const out: Record<string, string> = {};
@@ -341,10 +359,9 @@ async function ensureSelfHostedAdminKey(baseDir: string, values: Record<string, 
     return values;
   }
 
-  await runOrThrow("docker", ["compose", "-f", "deploy/docker/convex-compose.yml", "up", "-d", "backend"], baseDir);
-  const result = await runOrThrow(
-    "docker",
-    ["compose", "-f", "deploy/docker/convex-compose.yml", "exec", "-T", "backend", "./generate_admin_key.sh"],
+  await runDockerComposeOrThrow(["-f", "deploy/docker/convex-compose.yml", "up", "-d", "backend"], baseDir);
+  const result = await runDockerComposeOrThrow(
+    ["-f", "deploy/docker/convex-compose.yml", "exec", "-T", "backend", "./generate_admin_key.sh"],
     baseDir
   );
   const key = extractAdminKeyFromOutput(`${result.stdout}\n${result.stderr}`);
@@ -641,8 +658,22 @@ async function installCommand(opts: InstallOptions) {
         await bashOrThrow("sudo apt-get install -y redis-server");
       }
 
-      if ((mode === "docker" || convexMode === "self-hosted") && !(await commandExists("docker"))) {
-        await bashOrThrow("sudo apt-get install -y docker.io docker-compose-plugin");
+      if (mode === "docker" || convexMode === "self-hosted") {
+        if (!(await commandExists("docker"))) {
+          await bashOrThrow("sudo apt-get install -y docker.io");
+        }
+        const composeReady = (await hasDockerComposePlugin()) || (await commandExists("docker-compose"));
+        if (!composeReady) {
+          await bashOrThrow(
+            "sudo apt-get install -y docker-compose-plugin || sudo apt-get install -y docker-compose-v2 || sudo apt-get install -y docker-compose || true"
+          );
+        }
+        const composeReadyAfterInstall = (await hasDockerComposePlugin()) || (await commandExists("docker-compose"));
+        if (!composeReadyAfterInstall) {
+          throw new Error(
+            "Docker compose is required but unavailable. Install docker-compose-plugin or docker-compose and rerun setup."
+          );
+        }
       }
 
       await ensureRedisConfigLinux();
@@ -698,7 +729,7 @@ async function installCommand(opts: InstallOptions) {
 
   if (convexMode === "self-hosted") {
     console.log("[install] launching self-hosted Convex");
-    await runOrThrow("docker", ["compose", "-f", "deploy/docker/convex-compose.yml", "up", "-d"], targetDir);
+    await runDockerComposeOrThrow(["-f", "deploy/docker/convex-compose.yml", "up", "-d"], targetDir);
     envValues = await ensureSelfHostedAdminKey(targetDir, envValues);
     await deployConvexSelfHosted(targetDir, envValues);
     const autoConvexUrl = envValues.CONVEX_SELF_HOSTED_URL ?? DEFAULT_SELF_HOSTED_CONVEX_URL;
@@ -727,7 +758,7 @@ async function installCommand(opts: InstallOptions) {
     await bashOrThrow("sudo systemctl restart superhuman-web superhuman-worker superhuman-frontend");
   } else {
     console.log("[install] launching docker compose");
-    await runOrThrow("docker", ["compose", "-f", "deploy/docker/docker-compose.yml", "up", "-d", "--build"], targetDir);
+    await runDockerComposeOrThrow(["-f", "deploy/docker/docker-compose.yml", "up", "-d", "--build"], targetDir);
   }
 
   if (!opts.skipDoctor) {
