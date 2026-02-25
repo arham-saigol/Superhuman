@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { resolveConvexConfig, shouldSkipConvexDeploymentUrlCheck } from "./config.js";
+import { loadEnv, resolveConvexConfig, shouldSkipConvexDeploymentUrlCheck } from "./config.js";
 
 {
   const resolved = resolveConvexConfig({
@@ -41,5 +41,19 @@ import { resolveConvexConfig, shouldSkipConvexDeploymentUrlCheck } from "./confi
 
 assert.equal(shouldSkipConvexDeploymentUrlCheck("https://foo.convex.cloud"), false);
 assert.equal(shouldSkipConvexDeploymentUrlCheck("http://127.0.0.1:3210"), true);
+
+{
+  const env = loadEnv({
+    APP_URL: "http://localhost:3000",
+    REDIS_URL: "redis://localhost:6379",
+    OAUTH_ENCRYPTION_KEY: "abcdefghijklmnopqrstuvwxyz123456",
+    OLLAMA_BASE_URL: "",
+    BASETEN_BASE_URL: "",
+    CONVEX_SELF_HOSTED_URL: ""
+  });
+  assert.equal(env.OLLAMA_BASE_URL, undefined);
+  assert.equal(env.BASETEN_BASE_URL, undefined);
+  assert.equal(env.CONVEX_SELF_HOSTED_URL, undefined);
+}
 
 console.log("core config tests passed");

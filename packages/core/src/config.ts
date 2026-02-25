@@ -1,22 +1,27 @@
 import { z } from "zod";
 
+const optionalUrl = z.preprocess(
+  (value) => (typeof value === "string" && value.trim() === "" ? undefined : value),
+  z.string().url().optional()
+);
+
 const envSchema = z.object({
   NODE_ENV: z.enum(["development", "test", "production"]).default("development"),
   APP_URL: z.string().url().default("http://localhost:3000"),
   REDIS_URL: z.string().default("redis://localhost:6379"),
-  CONVEX_SELF_HOSTED_URL: z.string().url().optional(),
+  CONVEX_SELF_HOSTED_URL: optionalUrl,
   CONVEX_SELF_HOSTED_ADMIN_KEY: z.string().optional(),
-  CONVEX_URL: z.string().url().optional(),
+  CONVEX_URL: optionalUrl,
   CONVEX_DEPLOYMENT: z.string().min(1).optional(),
   CONVEX_ADMIN_KEY: z.string().optional(),
   AGENTMAIL_API_KEY: z.string().optional(),
   DEEPGRAM_API_KEY: z.string().optional(),
   FIREWORKS_API_KEY: z.string().optional(),
-  FIREWORKS_BASE_URL: z.string().url().optional(),
+  FIREWORKS_BASE_URL: optionalUrl,
   OLLAMA_API_KEY: z.string().optional(),
-  OLLAMA_BASE_URL: z.string().url().optional(),
+  OLLAMA_BASE_URL: optionalUrl,
   BASETEN_API_KEY: z.string().optional(),
-  BASETEN_BASE_URL: z.string().url().optional(),
+  BASETEN_BASE_URL: optionalUrl,
   DEEPSEEK_API_KEY: z.string().optional(),
   TAVILY_API_KEY: z.string().optional(),
   CODEX_ACCESS_TOKEN: z.string().optional(),
@@ -31,7 +36,7 @@ const envSchema = z.object({
   QWEN_OAUTH_AUTH_URL: z.string().url().default("https://auth.qwen.ai/oauth/authorize"),
   QWEN_OAUTH_TOKEN_URL: z.string().url().default("https://auth.qwen.ai/oauth/token"),
   QWEN_OAUTH_SCOPES: z.string().default("openid profile email offline_access"),
-  QWEN_BASE_URL: z.string().url().optional(),
+  QWEN_BASE_URL: optionalUrl,
   OAUTH_ENCRYPTION_KEY: z.string().min(32).default("replace-with-a-real-32-byte-secret-value")
 });
 
