@@ -18,9 +18,20 @@ const KNOWN_UPSTREAM_MODEL_IDS: Partial<Record<ProviderId, Partial<Record<ModelI
     "qwen-3.5": ["qwen-3.5", "qwen3", "qwen-plus"]
   },
   fireworks: {
-    "minimax-m2.5": ["fireworks/minimax-m2p5", "minimax-m2p5", "minimax-m2.5"],
-    "glm-5": ["fireworks/glm-5", "glm-5"],
-    "deepseek-v3.2": ["fireworks/deepseek-v3p2", "deepseek-v3p2", "deepseek-v3.2", "deepseek-v3"]
+    "minimax-m2.5": [
+      "fireworks/minimax-m2p5",
+      "accounts/fireworks/models/minimax-m2p5",
+      "minimax-m2p5",
+      "minimax-m2.5"
+    ],
+    "glm-5": ["fireworks/glm-5", "accounts/fireworks/models/glm-5", "glm-5"],
+    "deepseek-v3.2": [
+      "fireworks/deepseek-v3p2",
+      "accounts/fireworks/models/deepseek-v3p2",
+      "deepseek-v3p2",
+      "deepseek-v3.2",
+      "deepseek-v3"
+    ]
   },
   deepseek: {
     "deepseek-v3.2": ["deepseek-chat", "deepseek-v3.2", "deepseek-v3"]
@@ -55,6 +66,28 @@ function normalizeModelId(value: string): string {
   return value.toLowerCase().replace(/[^a-z0-9]/g, "");
 }
 
+function modelVersionCompatible(provider: ProviderId, targetModel: ModelId, candidateId: string): boolean {
+  const raw = candidateId.toLowerCase();
+
+  switch (targetModel) {
+    case "minimax-m2.5":
+      return raw.includes("minimax") && /m2([._-]?5|p5)/.test(raw);
+    case "glm-5":
+      return raw.includes("glm") && /(^|[^0-9])5([^0-9]|$)/.test(raw);
+    case "deepseek-v3.2":
+      if (provider === "deepseek") {
+        return raw.includes("deepseek-chat") || (raw.includes("deepseek") && /v3([._-]?2|p2)/.test(raw));
+      }
+      return raw.includes("deepseek") && /v3([._-]?2|p2)/.test(raw);
+    case "qwen-3.5":
+      return raw.includes("qwen") && (/(3([._-]?5|p5))/.test(raw) || raw.includes("qwen-plus") || raw.includes("qwenplus"));
+    case "gpt-5.3-codex":
+      return raw.includes("gpt") && /(5([._-]?3)?)/.test(raw);
+    default:
+      return true;
+  }
+}
+
 function modelMatchScore(targetModel: ModelId, candidateId: string): number {
   const raw = candidateId.toLowerCase();
   const normalized = normalizeModelId(candidateId);
@@ -83,10 +116,10 @@ function modelMatchScore(targetModel: ModelId, candidateId: string): number {
   return checks.reduce((sum, [ok, points]) => sum + (ok ? points : 0), 0);
 }
 
-function rankedDiscoveredCandidates(targetModel: ModelId, discoveredModelIds: string[]): string[] {
+function rankedDiscoveredCandidates(provider: ProviderId, targetModel: ModelId, discoveredModelIds: string[]): string[] {
   const ranked = discoveredModelIds
     .map((id) => ({ id, score: modelMatchScore(targetModel, id) }))
-    .filter((item) => item.score > 0)
+    .filter((item) => item.score > 0 && modelVersionCompatible(provider, targetModel, item.id))
     .sort((a, b) => b.score - a.score)
     .map((item) => item.id);
 
@@ -130,6 +163,40 @@ async function fetchProviderModelIds(
     return ids;
   } catch {
     return [];
+  }
+}
+
+function normalizeBaseUrl(provider: ProviderId, rawBaseURL: string): string {
+  const trimmed = rawBaseURL.trim();
+  if (!trimmed) return rawBaseURL;
+
+  try {
+    const parsed = new URL(trimmed);
+    const hostname = parsed.hostname.toLowerCase();
+    const stripTrailing = (value: string) => value.replace(/\/+$/, "");
+    let pathname = stripTrailing(parsed.pathname || "");
+    pathname = pathname.replace(/\/(chat\/completions|completions|responses)$/, "");
+
+    if (provider === "fireworks" && hostname.endsWith("fireworks.ai")) {
+      if (!pathname || pathname === "/") pathname = "/inference/v1";
+      if (pathname === "/inference") pathname = "/inference/v1";
+    }
+
+    if (provider === "qwen" && hostname.includes("dashscope")) {
+      if (!pathname || pathname === "/") pathname = "/compatible-mode/v1";
+      if (pathname === "/compatible-mode") pathname = "/compatible-mode/v1";
+    }
+
+    if (provider === "ollama") {
+      if (!pathname || pathname === "/") pathname = "/v1";
+    }
+
+    parsed.pathname = pathname || "/";
+    parsed.search = "";
+    parsed.hash = "";
+    return parsed.toString().replace(/\/$/, "");
+  } catch {
+    return rawBaseURL;
   }
 }
 
@@ -179,28 +246,28 @@ function getProviderConfig(provider: ProviderId, env: AppEnv): { baseURL: string
   switch (provider) {
     case "codex":
       if (!env.CODEX_ACCESS_TOKEN) return null;
-      return { baseURL: "https://api.openai.com/v1", apiKey: env.CODEX_ACCESS_TOKEN };
+      return { baseURL: normalizeBaseUrl(provider, "https://api.openai.com/v1"), apiKey: env.CODEX_ACCESS_TOKEN };
     case "qwen":
       if (!env.QWEN_API_KEY) return null;
       return {
-        baseURL: env.QWEN_BASE_URL ?? "https://dashscope.aliyuncs.com/compatible-mode/v1",
+        baseURL: normalizeBaseUrl(provider, env.QWEN_BASE_URL ?? "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"),
         apiKey: env.QWEN_API_KEY
       };
     case "fireworks":
       if (!env.FIREWORKS_API_KEY) return null;
       return {
-        baseURL: env.FIREWORKS_BASE_URL ?? "https://api.fireworks.ai/inference/v1",
+        baseURL: normalizeBaseUrl(provider, env.FIREWORKS_BASE_URL ?? "https://api.fireworks.ai/inference/v1"),
         apiKey: env.FIREWORKS_API_KEY
       };
     case "deepseek":
       if (!env.DEEPSEEK_API_KEY) return null;
-      return { baseURL: "https://api.deepseek.com", apiKey: env.DEEPSEEK_API_KEY };
+      return { baseURL: normalizeBaseUrl(provider, "https://api.deepseek.com"), apiKey: env.DEEPSEEK_API_KEY };
     case "ollama":
       if (!env.OLLAMA_API_KEY || !env.OLLAMA_BASE_URL) return null;
-      return { baseURL: env.OLLAMA_BASE_URL, apiKey: env.OLLAMA_API_KEY };
+      return { baseURL: normalizeBaseUrl(provider, env.OLLAMA_BASE_URL), apiKey: env.OLLAMA_API_KEY };
     case "baseten":
       if (!env.BASETEN_API_KEY || !env.BASETEN_BASE_URL) return null;
-      return { baseURL: env.BASETEN_BASE_URL, apiKey: env.BASETEN_API_KEY };
+      return { baseURL: normalizeBaseUrl(provider, env.BASETEN_BASE_URL), apiKey: env.BASETEN_API_KEY };
     default:
       return null;
   }
@@ -281,7 +348,7 @@ export async function generateModelResponse(
   const explicitOverride = envModelOverride(binding.provider, binding.model);
   const knownCandidates = knownModelCandidates(binding.provider, binding.model);
   const discoveredModelIds = await fetchProviderModelIds(binding.provider, providerConfig);
-  const discoveredCandidates = rankedDiscoveredCandidates(binding.model, discoveredModelIds);
+  const discoveredCandidates = rankedDiscoveredCandidates(binding.provider, binding.model, discoveredModelIds);
   const providerCandidates = dedupeNonEmpty([
     ...(explicitOverride ? [explicitOverride] : []),
     ...knownCandidates,

@@ -107,10 +107,17 @@ Required for base runtime:
 Optional provider integrations (no longer required for initial setup):
 - `AGENTMAIL_API_KEY`, `DEEPGRAM_API_KEY`, `FIREWORKS_API_KEY`, `OLLAMA_API_KEY`, `BASETEN_API_KEY`, `DEEPSEEK_API_KEY`, `TAVILY_API_KEY`
 
+Provider base URL defaults:
+- Fireworks: `https://api.fireworks.ai/inference/v1`
+- DeepSeek: `https://api.deepseek.com`
+- Qwen (DashScope compat): `https://dashscope-intl.aliyuncs.com/compatible-mode/v1`
+- Ollama (OpenAI compat): `http://127.0.0.1:11434/v1` (set `OLLAMA_BASE_URL`)
+
 Optional exact model ID overrides:
 - Key pattern: `MODEL_OVERRIDE_<PROVIDER>_<LOGICAL_MODEL>`
 - Example mappings:
   - `MODEL_OVERRIDE_FIREWORKS_MINIMAX_M2_5=fireworks/minimax-m2p5`
+  - `MODEL_OVERRIDE_FIREWORKS_MINIMAX_M2_5=accounts/fireworks/models/minimax-m2p5`
   - `MODEL_OVERRIDE_FIREWORKS_GLM_5=fireworks/glm-5`
   - `MODEL_OVERRIDE_FIREWORKS_DEEPSEEK_V3_2=fireworks/deepseek-v3p2`
   - `MODEL_OVERRIDE_DEEPSEEK_DEEPSEEK_V3_2=deepseek-chat`
