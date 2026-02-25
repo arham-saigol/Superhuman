@@ -506,13 +506,17 @@ async function writeSystemdUnits(targetDir: string, serviceUser: string) {
   await writeFile(join(systemdDir, "superhuman-frontend.service"), frontendUnit, "utf8");
 }
 
-async function buildOpenWebUI(openWebUiDir: string) {
+async function buildOpenWebUI(openWebUiDir: string, apiBaseUrl?: string) {
   const attempts = ["4096", "6144"];
   let lastError: Error | null = null;
+  const resolvedApiBaseUrl = (apiBaseUrl ?? `http://127.0.0.1:${WEB_PORT}`).trim();
 
   for (const memory of attempts) {
     try {
-      await bashOrThrow(`export NODE_OPTIONS=--max-old-space-size=${memory}; npm run build`, openWebUiDir);
+      await bashOrThrow(
+        `export NODE_OPTIONS=--max-old-space-size=${memory}; export VITE_SUPERHUMAN_WEBUI_BASE_URL=${shellQuote(resolvedApiBaseUrl)}; npm run build`,
+        openWebUiDir
+      );
       return;
     } catch (error) {
       lastError = error as Error;
@@ -725,7 +729,8 @@ async function installCommand(opts: InstallOptions) {
   } else {
     await runOrThrow("npm", ["install", "--no-audit", "--no-fund", "--legacy-peer-deps"], openWebUiDir);
   }
-  await buildOpenWebUI(openWebUiDir);
+  const initialAppUrl = (envValues.APP_URL ?? process.env.APP_URL ?? `http://127.0.0.1:${WEB_PORT}`).trim();
+  await buildOpenWebUI(openWebUiDir, initialAppUrl);
 
   if (convexMode === "self-hosted") {
     console.log("[install] launching self-hosted Convex");
@@ -1646,6 +1651,14 @@ async function setupCommand(opts: SetupOptions) {
     envOverrides,
     runOAuth: !auto
   });
+
+  const postOnboardEnvPath = join(targetDir, ".env");
+  const postOnboardEnv = existsSync(postOnboardEnvPath)
+    ? parseDotEnv(readFileSync(postOnboardEnvPath, "utf8"))
+    : {};
+  const configuredAppUrl = (postOnboardEnv.APP_URL ?? process.env.APP_URL ?? `http://127.0.0.1:${WEB_PORT}`).trim();
+  console.log(`[setup] rebuilding Open WebUI with API base ${configuredAppUrl}`);
+  await buildOpenWebUI(join(targetDir, "vendor", "open-webui"), configuredAppUrl);
 
   if (process.platform === "linux" && mode === "systemd") {
     await ensureServiceOwnershipLinux(targetDir, serviceUser);
