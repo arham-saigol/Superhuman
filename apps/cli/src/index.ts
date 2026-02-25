@@ -1178,7 +1178,8 @@ async function onboardCommand(baseDir = process.cwd(), preferSelfHosted = true, 
     }
     const result = await validateKey(key, value, merged, { required: false });
     if (!result.ok) {
-      throw new Error(`Validation failed for ${key}: ${result.detail}`);
+      console.log(`[onboard] ${key}: warning (${result.detail})`);
+      continue;
     }
     console.log(`[onboard] ${key}: ${result.detail}`);
   }
@@ -1197,9 +1198,10 @@ async function onboardCommand(baseDir = process.cwd(), preferSelfHosted = true, 
   if (merged.TAVILY_API_KEY) {
     const tavilyResult = await validateKey("TAVILY_API_KEY", merged.TAVILY_API_KEY, merged, { required: false });
     if (!tavilyResult.ok) {
-      throw new Error(`Validation failed for TAVILY_API_KEY: ${tavilyResult.detail}`);
+      console.log(`[onboard] TAVILY_API_KEY: warning (${tavilyResult.detail})`);
+    } else {
+      console.log(`[onboard] TAVILY_API_KEY: ${tavilyResult.detail}`);
     }
-    console.log(`[onboard] TAVILY_API_KEY: ${tavilyResult.detail}`);
   } else {
     console.log("[onboard] TAVILY_API_KEY: not set (web search tool disabled)");
   }
@@ -1332,7 +1334,8 @@ async function configureProvidersCommand(baseDir = process.cwd()) {
     }
     const result = await validateKey(key, value, merged, { required: false });
     if (!result.ok) {
-      throw new Error(`Validation failed for ${key}: ${result.detail}`);
+      console.log(`[configure] ${key}: warning (${result.detail})`);
+      continue;
     }
     console.log(`[configure] ${key}: ${result.detail}`);
   }
