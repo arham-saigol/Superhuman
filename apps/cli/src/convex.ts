@@ -6,7 +6,19 @@ export function isPlaceholderSecret(value: string | undefined): boolean {
 }
 
 export function extractAdminKeyFromOutput(output: string): string | null {
-  const lines = output.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+  // Normalize ANSI/control noise first because docker compose exec output can include formatting.
+  const cleaned = output
+    .replace(/\u001B\[[0-9;]*[A-Za-z]/g, "")
+    .replace(/\r/g, "")
+    .trim();
+
+  // Fast-path: extract key directly if present anywhere in output.
+  const inline = cleaned.match(/\b(convex-self-hosted\|[a-f0-9]+)\b/i);
+  if (inline?.[1]) {
+    return inline[1].trim();
+  }
+
+  const lines = cleaned.split(/\n/).map((line) => line.trim()).filter(Boolean);
   for (let idx = 0; idx < lines.length; idx += 1) {
     const line = lines[idx];
     const match = line.match(/^admin key:\s*(.+)$/i);

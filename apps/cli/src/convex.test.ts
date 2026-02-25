@@ -51,6 +51,10 @@ assert.equal(isPlaceholderSecret("real-secret"), false);
   assert.equal(key, "admin|abc123");
   const keySplitLine = extractAdminKeyFromOutput("Admin key:\nconvex-self-hosted|abc123\n");
   assert.equal(keySplitLine, "convex-self-hosted|abc123");
+  const noisy = extractAdminKeyFromOutput(
+    "Docker Compose version 2.37.1\n\u001b[32mAdmin key:\u001b[0m\nconvex-self-hosted|015a0c01cdaea5d0\n"
+  );
+  assert.equal(noisy, "convex-self-hosted|015a0c01cdaea5d0");
   assert.equal(extractAdminKeyFromOutput("no key here"), null);
 }
 
