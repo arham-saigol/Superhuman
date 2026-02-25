@@ -9,7 +9,7 @@ WorkingDirectory=/opt/superhuman
 EnvironmentFile=/opt/superhuman/.env
 Environment=NODE_ENV=production
 Environment=PATH=/usr/local/bin:/usr/bin:/bin
-ExecStart=/usr/bin/env pnpm --filter @superhuman/web start
+ExecStart=/usr/bin/env node apps/web/dist/server.js
 Restart=always
 RestartSec=5
 TimeoutStopSec=30

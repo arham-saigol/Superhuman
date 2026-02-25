@@ -475,9 +475,9 @@ function serviceUnitContent(params: {
 async function writeSystemdUnits(targetDir: string, serviceUser: string) {
   const systemdDir = join(targetDir, "deploy", "systemd");
   const envFile = `${targetDir}/.env`;
-  const webExec = "/usr/bin/env pnpm --filter @superhuman/web start";
-  const workerExec = "/usr/bin/env pnpm --filter @superhuman/worker start";
-  const frontendExec = "/usr/bin/env bash -lc 'export VITE_SUPERHUMAN_WEBUI_BASE_URL=${APP_URL:-http://127.0.0.1:3000}; npm run preview -- --host 0.0.0.0 --port ${FRONTEND_PORT}'";
+  const webExec = "/usr/bin/env node apps/web/dist/server.js";
+  const workerExec = "/usr/bin/env node apps/worker/dist/index.js";
+  const frontendExec = "/usr/bin/env bash -c 'export VITE_SUPERHUMAN_WEBUI_BASE_URL=${APP_URL:-http://127.0.0.1:3000}; npm run preview -- --host 0.0.0.0 --port ${FRONTEND_PORT:-4173}'";
 
   const webUnit = serviceUnitContent({
     description: "Superhuman Web Service",
