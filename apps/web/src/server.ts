@@ -799,6 +799,8 @@ app.get("/api/config", async () => {
     default_models: ["gpt-5.3-codex"],
     features: {
       enable_signup: true,
+      enable_login_form: true,
+      enable_ldap: false,
       enable_websocket: false,
       enable_direct_connections: false,
       enable_message_rating: false,
@@ -817,7 +819,7 @@ app.get("/api/config", async () => {
       enable_code_execution: false,
       auth_trusted_header: false,
       oauth: {
-        providers: ["codex", "qwen"]
+        providers: {}
       }
     }
   };
