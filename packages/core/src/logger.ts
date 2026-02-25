@@ -14,6 +14,7 @@ export const logger = pino({
       "env.FIREWORKS_API_KEY",
       "env.OLLAMA_API_KEY",
       "env.BASETEN_API_KEY",
+      "env.CONVEX_SELF_HOSTED_ADMIN_KEY",
       "env.CONVEX_ADMIN_KEY"
     ],
     censor: "[REDACTED]"

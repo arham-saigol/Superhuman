@@ -4,6 +4,8 @@ const envSchema = z.object({
   NODE_ENV: z.enum(["development", "test", "production"]).default("development"),
   APP_URL: z.string().url().default("http://localhost:3000"),
   REDIS_URL: z.string().default("redis://localhost:6379"),
+  CONVEX_SELF_HOSTED_URL: z.string().url().optional(),
+  CONVEX_SELF_HOSTED_ADMIN_KEY: z.string().optional(),
   CONVEX_URL: z.string().url().optional(),
   CONVEX_DEPLOYMENT: z.string().min(1).optional(),
   CONVEX_ADMIN_KEY: z.string().optional(),
@@ -37,4 +39,61 @@ export type AppEnv = z.infer<typeof envSchema>;
 
 export function loadEnv(source: NodeJS.ProcessEnv = process.env): AppEnv {
   return envSchema.parse(source);
+}
+
+export type ConvexMode = "self-hosted" | "cloud" | "none";
+
+export type ResolvedConvexConfig = {
+  mode: ConvexMode;
+  url: string | null;
+  adminKey: string | null;
+  skipConvexDeploymentUrlCheck: boolean;
+};
+
+function isConvexCloudHostname(hostname: string): boolean {
+  return hostname === "convex.cloud" || hostname.endsWith(".convex.cloud");
+}
+
+export function shouldSkipConvexDeploymentUrlCheck(url: string): boolean {
+  try {
+    const parsed = new URL(url);
+    return !isConvexCloudHostname(parsed.hostname);
+  } catch {
+    return false;
+  }
+}
+
+export function resolveConvexConfig(
+  source: Record<string, string | undefined> | Partial<AppEnv> = process.env
+): ResolvedConvexConfig {
+  const selfHostedUrl = source.CONVEX_SELF_HOSTED_URL?.trim();
+  const selfHostedAdminKey = source.CONVEX_SELF_HOSTED_ADMIN_KEY?.trim();
+  const cloudUrl = source.CONVEX_URL?.trim();
+  const cloudAdminKey = source.CONVEX_ADMIN_KEY?.trim();
+
+  if (selfHostedUrl) {
+    return {
+      mode: "self-hosted",
+      url: selfHostedUrl,
+      adminKey: selfHostedAdminKey || null,
+      skipConvexDeploymentUrlCheck: true
+    };
+  }
+
+  if (cloudUrl) {
+    const skipCheck = shouldSkipConvexDeploymentUrlCheck(cloudUrl);
+    return {
+      mode: skipCheck ? "self-hosted" : "cloud",
+      url: cloudUrl,
+      adminKey: cloudAdminKey || null,
+      skipConvexDeploymentUrlCheck: skipCheck
+    };
+  }
+
+  return {
+    mode: "none",
+    url: null,
+    adminKey: null,
+    skipConvexDeploymentUrlCheck: false
+  };
 }

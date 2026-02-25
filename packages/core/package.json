@@ -8,7 +8,7 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "node -e \"console.log('no tests yet')\"",
+    "test": "pnpm build && node dist/config.test.js",
     "lint": "node -e \"console.log('no lint config yet')\""
   },
   "dependencies": {

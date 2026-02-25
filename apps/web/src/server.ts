@@ -4,10 +4,11 @@ import Redis from "ioredis";
 import { ConvexHttpClient } from "convex/browser";
 import { randomUUID, createHash, randomBytes } from "node:crypto";
 import { enqueueTask, getTaskStatus, setTaskStatus } from "@superhuman/agent";
-import { loadEnv, logger, encryptString } from "@superhuman/core";
+import { loadEnv, logger, encryptString, resolveConvexConfig } from "@superhuman/core";
 import { generateModelResponse, listOpenAIStyleModels, type OpenAIStyleChatCompletionRequest } from "@superhuman/providers";
 
 const env = loadEnv();
+const convexConfig = resolveConvexConfig(env);
 const app = Fastify({ logger: false });
 
 type RedisClient = {
@@ -391,12 +392,30 @@ function createPkcePair(): { verifier: string; challenge: string } {
   return { verifier, challenge };
 }
 
-function convexAdminClient(): ConvexHttpClient | null {
-  if (!env.CONVEX_URL || !env.CONVEX_ADMIN_KEY) {
+function convexHttpClient(auth?: string): ConvexHttpClient | null {
+  if (!convexConfig.url) {
     return null;
   }
-  const client = new ConvexHttpClient(env.CONVEX_URL);
-  (client as unknown as { setAdminAuth: (token: string) => void }).setAdminAuth(env.CONVEX_ADMIN_KEY);
+
+  const options: Record<string, unknown> = {};
+  if (auth) {
+    options.auth = auth;
+  }
+  if (convexConfig.skipConvexDeploymentUrlCheck) {
+    options.skipConvexDeploymentUrlCheck = true;
+  }
+  return new ConvexHttpClient(convexConfig.url, options as ConstructorParameters<typeof ConvexHttpClient>[1]);
+}
+
+function convexAdminClient(): ConvexHttpClient | null {
+  if (!convexConfig.adminKey) {
+    return null;
+  }
+  const client = convexHttpClient();
+  if (!client) {
+    return null;
+  }
+  (client as unknown as { setAdminAuth: (token: string) => void }).setAdminAuth(convexConfig.adminKey);
   return client;
 }
 
@@ -549,12 +568,15 @@ async function requireActiveAllowlistedProfile(
   token: string,
   reply: { status: (code: number) => { send: (body: unknown) => unknown } }
 ): Promise<boolean> {
-  if (!env.CONVEX_URL) {
+  if (!convexConfig.url) {
     return true;
   }
 
   try {
-    const client = new ConvexHttpClient(env.CONVEX_URL, { auth: token });
+    const client = convexHttpClient(token);
+    if (!client) {
+      return true;
+    }
     let status = (await (client as unknown as { query: (name: string, args: unknown) => Promise<unknown> }).query(
       "users:accessStatus",
       {}
@@ -2332,11 +2354,14 @@ app.post("/api/settings/providers/test", async (request) => {
 
 app.get("/api/access/status", async (request) => {
   const token = bearerToken(request.headers.authorization);
-  if (!token || !env.CONVEX_URL) {
+  if (!token || !convexConfig.url) {
     return { authenticated: false, allowlisted: false, activeProfile: false };
   }
 
-  const authedClient = new ConvexHttpClient(env.CONVEX_URL, { auth: token });
+  const authedClient = convexHttpClient(token);
+  if (!authedClient) {
+    return { authenticated: false, allowlisted: false, activeProfile: false };
+  }
   const status = (await (authedClient as unknown as { query: (name: string, args: unknown) => Promise<unknown> }).query(
     "users:accessStatus",
     {}
